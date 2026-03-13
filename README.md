@@ -18,6 +18,7 @@ models: #关联模型
 # deployspec:
 #   entry_file: app.py
 license: Apache License 2.0
+python_version: "3.10"
 ---
 #### Clone with HTTP
 ```bash
