@@ -1,5 +1,14 @@
 ---
 title: Serve AI Tracker
+sdk: gradio
+sdk_version: 4.x.x
+app_file: app.py
+python_version: "3.10"
+---
+
+# Serve_Score (这里往下保留你原本写的说明文字)
+---
+title: Serve AI Tracker
 emoji: 🎾
 colorFrom: blue
 colorTo: green
