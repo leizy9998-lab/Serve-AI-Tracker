@@ -1,0 +1,5 @@
+gradio
+mediapipe==0.10.9
+opencv-python-headless
+numpy
+pandas
