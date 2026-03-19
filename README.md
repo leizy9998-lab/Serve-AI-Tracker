@@ -6,33 +6,19 @@ app_file: app.py
 python_version: "3.10"
 ---
 
-# Serve_Score (这里往下保留你原本写的说明文字)
----
-title: Serve AI Tracker
-emoji: 🎾
-colorFrom: blue
-colorTo: green
-sdk: gradio
-sdk_version: 4.x.x
-app_file: app.py
-pinned: false
-python_version: "3.10"
----
+# Serve AI Tracker
 
-# Serve_Score
+ModelScope 创空间精简运行版，仅保留在线演示所需文件：
 
-Short serve-clip scoring pipeline (pose extraction + scoring report).
+- `app.py`
+- `serve_score.py`
+- `requirements.txt`
 
-## Quick Start (Scoring Report)
+功能说明：
 
+- 上传一段网球发球视频
+- 用 MediaPipe 提取人体关键点
+- 调用 `serve_score.analyze_serve()` 输出发球评分与关键阶段
+- 返回带骨架回放的视频和文字评估结果
 
-# Serve_Score
-
-
-Short serve-clip scoring pipeline (pose extraction + scoring report).
-
-## Quick Start (Scoring Report)
-```
-conda activate servepose
-python make_report.py --video D:\Serve_Score\input\serve.mp4 --out_dir D:\Serve_Score\out\serve_report
-```
+如果需要完整的 3D 建模、关键帧报告、HybrIK 工作流和本地开发脚本，请使用主仓库开发分支。
