@@ -1,8 +1,10 @@
 import json
 import math
 import os
-from typing import Dict, List, Optional, Tuple
+import re
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
+import cv2
 import numpy as np
 import pandas as pd
 
@@ -703,6 +705,9 @@ def fix_hrp_lrp(
 
     wrist_y = signals.get("racket_wrist_y")
     elbow_y = signals.get("racket_elbow_y")
+    knee_angle = signals.get("knee_angle")
+    trunk_angle = signals.get("trunk_angle")
+    elbow_angle = signals.get("elbow_angle")
 
     def _find_local_extreme(series: Optional[np.ndarray], s: int, e: int) -> Optional[int]:
         """
@@ -731,8 +736,79 @@ def fix_hrp_lrp(
                 cand = lo + int(np.nanargmin(local))
         return int(cand)
 
+    def _norm_segment(values: np.ndarray, inverse: bool = False) -> np.ndarray:
+        out = np.zeros_like(values, dtype=float)
+        mask = np.isfinite(values)
+        if not mask.any():
+            return out
+        lo = float(np.nanmin(values[mask]))
+        hi = float(np.nanmax(values[mask]))
+        if hi - lo > 1e-8:
+            out[mask] = (values[mask] - lo) / (hi - lo)
+        if inverse:
+            out[mask] = 1.0 - out[mask]
+        return out
+
+    def _positive_grad_score(series: Optional[np.ndarray], idxs: np.ndarray) -> np.ndarray:
+        if series is None or len(series) == 0:
+            return np.zeros_like(idxs, dtype=float)
+        grad = np.gradient(series.astype(np.float64))
+        grad = np.where(np.isfinite(grad), np.maximum(grad, 0.0), np.nan)
+        return _norm_segment(grad[idxs])
+
+    def _direct_progress_score(series: Optional[np.ndarray], idxs: np.ndarray, start_idx: int, end_idx: int) -> np.ndarray:
+        if series is None or len(series) == 0:
+            return np.zeros_like(idxs, dtype=float)
+        start_val = float(series[start_idx]) if np.isfinite(series[start_idx]) else float("nan")
+        end_val = float(series[end_idx]) if np.isfinite(series[end_idx]) else float("nan")
+        if not np.isfinite(start_val) or not np.isfinite(end_val):
+            return np.zeros_like(idxs, dtype=float)
+        sign = 1.0 if end_val >= start_val else -1.0
+        progress = sign * (series[idxs] - start_val)
+        return _norm_segment(progress)
+
+    def _find_lrp_composite(s: int, e: int) -> Optional[int]:
+        idxs = np.arange(s, e + 1, dtype=int)
+        if idxs.size == 0:
+            return None
+
+        wrist_low = (
+            _norm_segment(wrist_y[idxs], inverse=not y_is_down)
+            if wrist_y is not None
+            else np.zeros_like(idxs, dtype=float)
+        )
+        elbow_low = (
+            _norm_segment(elbow_y[idxs], inverse=not y_is_down)
+            if elbow_y is not None
+            else np.zeros_like(idxs, dtype=float)
+        )
+        knee_extend = _positive_grad_score(knee_angle, idxs)
+        elbow_open = _positive_grad_score(elbow_angle, idxs)
+        trunk_drive = _direct_progress_score(trunk_angle, idxs, new_trophy, contact_idx)
+
+        score = (
+            0.30 * wrist_low
+            + 0.10 * elbow_low
+            + 0.20 * knee_extend
+            + 0.15 * trunk_drive
+            + 0.25 * elbow_open
+        )
+        valid = np.isfinite(score)
+        if not valid.any():
+            return None
+
+        max_score = float(np.nanmax(score[valid]))
+        keep = valid & (score >= max_score * 0.98)
+        if not keep.any():
+            return int(idxs[int(np.nanargmax(score))])
+        return int(idxs[np.flatnonzero(keep)[0]])
+
     if start < end:
-        new_drop = _find_local_extreme(wrist_y, start, end)
+        new_drop = _find_lrp_composite(start, end)
+        if new_drop is not None:
+            drop_status = "composite_refind_after_forced_trophy"
+        else:
+            new_drop = _find_local_extreme(wrist_y, start, end)
         if new_drop is None:
             new_drop = _find_local_extreme(elbow_y, start, end)
             if new_drop is not None:
@@ -752,7 +828,11 @@ def fix_hrp_lrp(
             e2 = contact_idx - (min_gap_drop_contact + 2)
             retry = None
             if s2 < e2:
-                retry = _find_local_extreme(wrist_y, s2, e2)
+                retry = _find_lrp_composite(s2, e2)
+                if retry is not None:
+                    drop_status = "composite_retry"
+                else:
+                    retry = _find_local_extreme(wrist_y, s2, e2)
                 if retry is None:
                     retry = _find_local_extreme(elbow_y, s2, e2)
                     if retry is not None:
@@ -1908,4 +1988,985 @@ def analyze_serve(
         "hand_mode_guess_scores": dual["hand_mode_guess_scores"],
         "quality_flags": quality_flags,
         "score_debug": score_debug,
+    }
+
+
+# -----------------------------
+# HybrIK / 3D verification utils
+# -----------------------------
+HYBRIK_SKELETON_EDGES = [
+    ("pelvis", "left_hip"),
+    ("left_hip", "left_knee"),
+    ("left_knee", "left_ankle"),
+    ("left_ankle", "left_foot"),
+    ("left_foot", "left_bigtoe"),
+    ("pelvis", "right_hip"),
+    ("right_hip", "right_knee"),
+    ("right_knee", "right_ankle"),
+    ("right_ankle", "right_foot"),
+    ("right_foot", "right_bigtoe"),
+    ("pelvis", "spine1"),
+    ("spine1", "spine2"),
+    ("spine2", "spine3"),
+    ("spine3", "neck"),
+    ("neck", "jaw"),
+    ("jaw", "head"),
+    ("spine3", "left_collar"),
+    ("left_collar", "left_shoulder"),
+    ("left_shoulder", "left_elbow"),
+    ("left_elbow", "left_wrist"),
+    ("left_wrist", "left_thumb"),
+    ("left_wrist", "left_middle"),
+    ("spine3", "right_collar"),
+    ("right_collar", "right_shoulder"),
+    ("right_shoulder", "right_elbow"),
+    ("right_elbow", "right_wrist"),
+    ("right_wrist", "right_thumb"),
+    ("right_wrist", "right_middle"),
+]
+
+HYBRIK_MP_JOINT_MAP = {
+    "left_shoulder": 11,
+    "right_shoulder": 12,
+    "left_elbow": 13,
+    "right_elbow": 14,
+    "left_wrist": 15,
+    "right_wrist": 16,
+    "left_hip": 23,
+    "right_hip": 24,
+    "left_knee": 25,
+    "right_knee": 26,
+    "left_ankle": 27,
+    "right_ankle": 28,
+}
+
+HYBRIK_SYMMETRY_SEGMENTS = {
+    "upper_arm": ("left_shoulder", "left_elbow", "right_shoulder", "right_elbow"),
+    "forearm": ("left_elbow", "left_wrist", "right_elbow", "right_wrist"),
+    "thigh": ("left_hip", "left_knee", "right_hip", "right_knee"),
+    "shank": ("left_knee", "left_ankle", "right_knee", "right_ankle"),
+}
+
+HYBRIK_3D_ANGLE_KEYS = [
+    "left_knee_angle_deg",
+    "right_knee_angle_deg",
+    "trunk_inclination_deg",
+    "shoulder_tilt_deg",
+    "right_elbow_angle_deg",
+]
+
+
+def compute_3d_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+    ba = a - b
+    bc = c - b
+    denom = np.linalg.norm(ba) * np.linalg.norm(bc)
+    if denom <= 1e-12:
+        return float("nan")
+    cosine_angle = np.dot(ba, bc) / denom
+    cosine_angle = np.clip(cosine_angle, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosine_angle)))
+
+
+def compute_vector_angle(v1: np.ndarray, v2: np.ndarray) -> float:
+    denom = np.linalg.norm(v1) * np.linalg.norm(v2)
+    if denom <= 1e-12:
+        return float("nan")
+    cosine_angle = np.dot(v1, v2) / denom
+    cosine_angle = np.clip(cosine_angle, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosine_angle)))
+
+
+def compute_line_tilt_to_horizontal(v: np.ndarray, vertical_axis: int = 1) -> float:
+    if np.linalg.norm(v) <= 1e-12:
+        return float("nan")
+    horizontal = np.delete(v, vertical_axis)
+    horizontal_norm = np.linalg.norm(horizontal)
+    vertical_mag = abs(v[vertical_axis])
+    return float(np.degrees(np.arctan2(vertical_mag, horizontal_norm)))
+
+
+def _load_json_object(path: str) -> object:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _extract_hybrik_joint_items(node: object) -> List[Dict[str, object]]:
+    if isinstance(node, list):
+        if node and isinstance(node[0], dict) and "xyz" in node[0]:
+            return [item for item in node if isinstance(item, dict) and "xyz" in item]
+        for item in node:
+            extracted = _extract_hybrik_joint_items(item)
+            if extracted:
+                return extracted
+        return []
+
+    if isinstance(node, dict):
+        for key in ["joints_3d_29", "joints", "keypoints"]:
+            extracted = _extract_hybrik_joint_items(node.get(key))
+            if extracted:
+                return extracted
+        for value in node.values():
+            extracted = _extract_hybrik_joint_items(value)
+            if extracted:
+                return extracted
+
+    return []
+
+
+def _normalize_joint_name(name: str) -> str:
+    return name.strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _build_hybrik_joint_map(items: Iterable[Dict[str, object]]) -> Dict[str, np.ndarray]:
+    joints: Dict[str, np.ndarray] = {}
+    for item in items:
+        name = item.get("name")
+        xyz = item.get("xyz")
+        if not isinstance(name, str) or not isinstance(xyz, list) or len(xyz) != 3:
+            continue
+        try:
+            joints[_normalize_joint_name(name)] = np.array(xyz, dtype=float)
+        except (TypeError, ValueError):
+            continue
+    return joints
+
+
+def _find_hybrik_joint(joints: Dict[str, np.ndarray], aliases: Iterable[str]) -> Optional[np.ndarray]:
+    normalized_aliases = [_normalize_joint_name(alias) for alias in aliases]
+    for alias in normalized_aliases:
+        if alias in joints:
+            return joints[alias]
+    for alias in normalized_aliases:
+        for name, value in joints.items():
+            if alias in name:
+                return value
+    return None
+
+
+def _infer_hybrik_y_axis_down(joints: Dict[str, np.ndarray]) -> bool:
+    shoulders = [
+        _find_hybrik_joint(joints, ["left_shoulder"]),
+        _find_hybrik_joint(joints, ["right_shoulder"]),
+    ]
+    hips = [
+        _find_hybrik_joint(joints, ["left_hip"]),
+        _find_hybrik_joint(joints, ["right_hip"]),
+    ]
+    shoulders = [v for v in shoulders if v is not None]
+    hips = [v for v in hips if v is not None]
+    if not shoulders or not hips:
+        return True
+    mean_shoulder_y = float(np.mean([v[1] for v in shoulders]))
+    mean_hip_y = float(np.mean([v[1] for v in hips]))
+    return mean_hip_y > mean_shoulder_y
+
+
+def load_hybrik_json(data_or_path: Union[str, Dict[str, object]]) -> Dict[str, object]:
+    if isinstance(data_or_path, str):
+        data = _load_json_object(data_or_path)
+    else:
+        data = data_or_path
+    if not isinstance(data, dict):
+        raise RuntimeError("Expected HybrIK JSON to be a dictionary object.")
+    return data
+
+
+def extract_hybrik_joint_items(data_or_path: Union[str, Dict[str, object]]) -> List[Dict[str, object]]:
+    data = load_hybrik_json(data_or_path)
+    return _extract_hybrik_joint_items(data)
+
+
+def load_hybrik_joint_xyz_map(data_or_path: Union[str, Dict[str, object]]) -> Dict[str, np.ndarray]:
+    return _build_hybrik_joint_map(extract_hybrik_joint_items(data_or_path))
+
+
+def load_hybrik_joint_score_map(data_or_path: Union[str, Dict[str, object]]) -> Dict[str, float]:
+    scores: Dict[str, float] = {}
+    for item in extract_hybrik_joint_items(data_or_path):
+        name = item.get("name")
+        score = item.get("score")
+        if isinstance(name, str) and isinstance(score, (int, float)):
+            scores[_normalize_joint_name(name)] = float(score)
+    return scores
+
+
+def analyze_trophy_pose_3d(data_or_path: Union[str, Dict[str, object]]) -> Tuple[Dict[str, float], Dict[str, object]]:
+    joints = load_hybrik_joint_xyz_map(data_or_path)
+    if not joints:
+        raise RuntimeError("No valid 3D joint entries with `name` and `xyz` were found in the HybrIK JSON.")
+
+    l_hip = _find_hybrik_joint(joints, ["left_hip", "l_hip"])
+    r_hip = _find_hybrik_joint(joints, ["right_hip", "r_hip"])
+    l_knee = _find_hybrik_joint(joints, ["left_knee", "l_knee"])
+    r_knee = _find_hybrik_joint(joints, ["right_knee", "r_knee"])
+    l_ankle = _find_hybrik_joint(joints, ["left_ankle", "l_ankle"])
+    r_ankle = _find_hybrik_joint(joints, ["right_ankle", "r_ankle"])
+    l_shoulder = _find_hybrik_joint(joints, ["left_shoulder", "l_shoulder"])
+    r_shoulder = _find_hybrik_joint(joints, ["right_shoulder", "r_shoulder"])
+    l_elbow = _find_hybrik_joint(joints, ["left_elbow", "l_elbow"])
+    r_elbow = _find_hybrik_joint(joints, ["right_elbow", "r_elbow"])
+    l_wrist = _find_hybrik_joint(joints, ["left_wrist", "l_wrist"])
+    r_wrist = _find_hybrik_joint(joints, ["right_wrist", "r_wrist"])
+    neck = _find_hybrik_joint(joints, ["neck", "spine3", "spine_3"])
+
+    if neck is None and l_shoulder is not None and r_shoulder is not None:
+        neck = (l_shoulder + r_shoulder) / 2.0
+
+    y_axis_down = _infer_hybrik_y_axis_down(joints)
+    vertical_up = np.array([0.0, -1.0 if y_axis_down else 1.0, 0.0], dtype=float)
+
+    metrics: Dict[str, float] = {}
+    metrics["left_knee_angle_deg"] = (
+        compute_3d_angle(l_hip, l_knee, l_ankle)
+        if l_hip is not None and l_knee is not None and l_ankle is not None
+        else float("nan")
+    )
+    metrics["right_knee_angle_deg"] = (
+        compute_3d_angle(r_hip, r_knee, r_ankle)
+        if r_hip is not None and r_knee is not None and r_ankle is not None
+        else float("nan")
+    )
+
+    pelvis_mid = None
+    spine_vector = None
+    if l_hip is not None and r_hip is not None and neck is not None:
+        pelvis_mid = (l_hip + r_hip) / 2.0
+        spine_vector = neck - pelvis_mid
+        metrics["trunk_inclination_deg"] = compute_vector_angle(spine_vector, vertical_up)
+    else:
+        metrics["trunk_inclination_deg"] = float("nan")
+
+    shoulder_vector = None
+    if l_shoulder is not None and r_shoulder is not None:
+        shoulder_vector = r_shoulder - l_shoulder
+        metrics["shoulder_tilt_deg"] = compute_line_tilt_to_horizontal(shoulder_vector, vertical_axis=1)
+    else:
+        metrics["shoulder_tilt_deg"] = float("nan")
+
+    metrics["left_elbow_angle_deg"] = (
+        compute_3d_angle(l_shoulder, l_elbow, l_wrist)
+        if l_shoulder is not None and l_elbow is not None and l_wrist is not None
+        else float("nan")
+    )
+    metrics["right_elbow_angle_deg"] = (
+        compute_3d_angle(r_shoulder, r_elbow, r_wrist)
+        if r_shoulder is not None and r_elbow is not None and r_wrist is not None
+        else float("nan")
+    )
+
+    source_json = os.path.abspath(data_or_path) if isinstance(data_or_path, str) else None
+    debug = {
+        "num_joints_loaded": len(joints),
+        "y_axis_down": y_axis_down,
+        "vertical_up_vector": vertical_up.tolist(),
+        "pelvis_mid": None if pelvis_mid is None else pelvis_mid.tolist(),
+        "spine_vector": None if spine_vector is None else spine_vector.tolist(),
+        "shoulder_vector": None if shoulder_vector is None else shoulder_vector.tolist(),
+        "source_json": source_json,
+    }
+    return metrics, debug
+
+
+def _require_joint(joints: Dict[str, np.ndarray], aliases: Iterable[str]) -> Optional[np.ndarray]:
+    return _find_hybrik_joint(joints, aliases)
+
+
+def compute_hybrik_body_height_proxy(data_or_path: Union[str, Dict[str, object]]) -> float:
+    joints = load_hybrik_joint_xyz_map(data_or_path)
+    l_hip = _require_joint(joints, ["left_hip"])
+    r_hip = _require_joint(joints, ["right_hip"])
+    l_knee = _require_joint(joints, ["left_knee"])
+    r_knee = _require_joint(joints, ["right_knee"])
+    l_ankle = _require_joint(joints, ["left_ankle"])
+    r_ankle = _require_joint(joints, ["right_ankle"])
+    neck = _require_joint(joints, ["neck", "spine3", "spine_3"])
+    head = _require_joint(joints, ["head", "jaw"])
+
+    if any(v is None for v in [l_hip, r_hip, l_knee, r_knee, l_ankle, r_ankle, neck]):
+        return float("nan")
+
+    left_leg = np.linalg.norm(l_hip - l_knee) + np.linalg.norm(l_knee - l_ankle)
+    right_leg = np.linalg.norm(r_hip - r_knee) + np.linalg.norm(r_knee - r_ankle)
+    pelvis_mid = (l_hip + r_hip) / 2.0
+    trunk = np.linalg.norm(neck - pelvis_mid)
+    head_len = np.linalg.norm(head - neck) if head is not None else 0.0
+    return float((left_leg + right_leg) / 2.0 + trunk + head_len)
+
+
+def _hybrik_vertical_up_vector(joints: Dict[str, np.ndarray]) -> np.ndarray:
+    y_axis_down = _infer_hybrik_y_axis_down(joints)
+    return np.array([0.0, -1.0 if y_axis_down else 1.0, 0.0], dtype=float)
+
+
+def compute_hybrik_contact_height_norm(
+    data_or_path: Union[str, Dict[str, object]],
+    side: str = "right",
+) -> float:
+    joints = load_hybrik_joint_xyz_map(data_or_path)
+    wrist = _require_joint(joints, [f"{side}_wrist"])
+    l_ankle = _require_joint(joints, ["left_ankle"])
+    r_ankle = _require_joint(joints, ["right_ankle"])
+    if wrist is None or l_ankle is None or r_ankle is None:
+        return float("nan")
+
+    body_height = compute_hybrik_body_height_proxy(data_or_path)
+    if not np.isfinite(body_height) or body_height <= 1e-8:
+        return float("nan")
+
+    ankle_mid = (l_ankle + r_ankle) / 2.0
+    vertical_up = _hybrik_vertical_up_vector(joints)
+    return float(np.dot(wrist - ankle_mid, vertical_up) / body_height)
+
+
+def compute_hybrik_shoulder_raise_deg(
+    data_or_path: Union[str, Dict[str, object]],
+    side: str = "right",
+) -> float:
+    joints = load_hybrik_joint_xyz_map(data_or_path)
+    shoulder = _require_joint(joints, [f"{side}_shoulder"])
+    elbow = _require_joint(joints, [f"{side}_elbow"])
+    l_hip = _require_joint(joints, ["left_hip"])
+    r_hip = _require_joint(joints, ["right_hip"])
+    if shoulder is None or elbow is None or l_hip is None or r_hip is None:
+        return float("nan")
+    pelvis_mid = (l_hip + r_hip) / 2.0
+    return compute_vector_angle(elbow - shoulder, pelvis_mid - shoulder)
+
+
+def compute_hybrik_elbow_flexion_deg(
+    data_or_path: Union[str, Dict[str, object]],
+    side: str = "right",
+) -> float:
+    joints = load_hybrik_joint_xyz_map(data_or_path)
+    shoulder = _require_joint(joints, [f"{side}_shoulder"])
+    elbow = _require_joint(joints, [f"{side}_elbow"])
+    wrist = _require_joint(joints, [f"{side}_wrist"])
+    if shoulder is None or elbow is None or wrist is None:
+        return float("nan")
+    elbow_angle = compute_3d_angle(shoulder, elbow, wrist)
+    return float(180.0 - elbow_angle) if np.isfinite(elbow_angle) else float("nan")
+
+
+def compute_hybrik_shoulder_external_rotation_proxy_deg(
+    data_or_path: Union[str, Dict[str, object]],
+    side: str = "right",
+) -> float:
+    joints = load_hybrik_joint_xyz_map(data_or_path)
+    shoulder = _require_joint(joints, [f"{side}_shoulder"])
+    elbow = _require_joint(joints, [f"{side}_elbow"])
+    wrist = _require_joint(joints, [f"{side}_wrist"])
+    neck = _require_joint(joints, ["neck", "spine3", "spine_3"])
+    l_hip = _require_joint(joints, ["left_hip"])
+    r_hip = _require_joint(joints, ["right_hip"])
+    if any(v is None for v in [shoulder, elbow, wrist, neck, l_hip, r_hip]):
+        return float("nan")
+
+    pelvis_mid = (l_hip + r_hip) / 2.0
+    torso = neck - pelvis_mid
+    upper_arm = elbow - shoulder
+    forearm = wrist - elbow
+    plane_normal = np.cross(torso, upper_arm)
+    plane_norm = np.linalg.norm(plane_normal)
+    forearm_norm = np.linalg.norm(forearm)
+    if plane_norm <= 1e-8 or forearm_norm <= 1e-8:
+        return float("nan")
+    sine_value = abs(float(np.dot(forearm / forearm_norm, plane_normal / plane_norm)))
+    sine_value = float(np.clip(sine_value, 0.0, 1.0))
+    return float(np.degrees(np.arcsin(sine_value)))
+
+
+def summarize_keyframe_pose_3d(
+    data_or_path: Union[str, Dict[str, object]],
+    phase: str,
+    dominant_hand: str = "right",
+) -> Dict[str, float]:
+    angles, _debug = analyze_trophy_pose_3d(data_or_path)
+    metrics: Dict[str, float] = dict(angles)
+
+    dominant_hand = dominant_hand.lower()
+    lead_side = "left" if dominant_hand == "right" else "right"
+    metrics["lead_knee_flexion_deg"] = float(
+        180.0 - metrics.get(f"{lead_side}_knee_angle_deg", float("nan"))
+    ) if np.isfinite(metrics.get(f"{lead_side}_knee_angle_deg", float("nan"))) else float("nan")
+    metrics["body_height_proxy"] = compute_hybrik_body_height_proxy(data_or_path)
+
+    if phase == "contact":
+        metrics["impact_height_norm"] = compute_hybrik_contact_height_norm(data_or_path, side=dominant_hand)
+        metrics["shoulder_raise_deg"] = compute_hybrik_shoulder_raise_deg(data_or_path, side=dominant_hand)
+        metrics["elbow_flexion_deg"] = compute_hybrik_elbow_flexion_deg(data_or_path, side=dominant_hand)
+    if phase == "racket_drop":
+        metrics["shoulder_external_rotation_proxy_deg"] = compute_hybrik_shoulder_external_rotation_proxy_deg(
+            data_or_path, side=dominant_hand
+        )
+
+    return metrics
+
+
+def project_hybrik_joints_2d(data_or_path: Union[str, Dict[str, object]]) -> Dict[str, np.ndarray]:
+    data = load_hybrik_json(data_or_path)
+    bbox = data.get("bbox_xyxy")
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        raise RuntimeError("Expected `bbox_xyxy` in HybrIK JSON.")
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    bw = x2 - x1
+
+    points: Dict[str, np.ndarray] = {}
+    for item in extract_hybrik_joint_items(data):
+        name = item.get("name")
+        uvd = item.get("uvd")
+        if not isinstance(name, str) or not isinstance(uvd, list) or len(uvd) != 3:
+            continue
+        x = float(uvd[0]) * bw + cx
+        y = float(uvd[1]) * bw + cy
+        points[_normalize_joint_name(name)] = np.array([x, y], dtype=float)
+    return points
+
+
+def load_obj_mesh(obj_path: str) -> Tuple[np.ndarray, np.ndarray]:
+    vertices: List[List[float]] = []
+    faces: List[List[int]] = []
+    with open(obj_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("v "):
+                parts = line.strip().split()
+                if len(parts) >= 4:
+                    vertices.append([float(parts[1]), float(parts[2]), float(parts[3])])
+            elif line.startswith("f "):
+                raw = []
+                for token in line.strip().split()[1:]:
+                    idx_str = token.split("/")[0]
+                    if idx_str:
+                        raw.append(int(idx_str) - 1)
+                if len(raw) == 3:
+                    faces.append(raw)
+                elif len(raw) > 3:
+                    for start in range(1, len(raw) - 1):
+                        faces.append([raw[0], raw[start], raw[start + 1]])
+    if not vertices or not faces:
+        raise RuntimeError(f"Failed to parse a valid mesh from OBJ: {obj_path}")
+    return np.asarray(vertices, dtype=float), np.asarray(faces, dtype=np.int32)
+
+
+def fit_hybrik_projection(data_or_path: Union[str, Dict[str, object]]) -> Dict[str, float]:
+    data = load_hybrik_json(data_or_path)
+    translation = data.get("translation")
+    if not isinstance(translation, list) or len(translation) != 3:
+        raise RuntimeError("Expected `translation` in HybrIK JSON.")
+
+    bbox = data.get("bbox_xyxy")
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        raise RuntimeError("Expected `bbox_xyxy` in HybrIK JSON.")
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    cx0 = (x1 + x2) / 2.0
+    cy0 = (y1 + y2) / 2.0
+    bw = x2 - x1
+
+    rows_3d: List[np.ndarray] = []
+    rows_2d: List[np.ndarray] = []
+    transl = np.asarray(translation, dtype=float)
+
+    for item in extract_hybrik_joint_items(data):
+        xyz = item.get("xyz")
+        uvd = item.get("uvd")
+        if not isinstance(xyz, list) or len(xyz) != 3:
+            continue
+        if not isinstance(uvd, list) or len(uvd) != 3:
+            continue
+        joint_3d = np.asarray(xyz, dtype=float) + transl
+        joint_2d = np.array(
+            [float(uvd[0]) * bw + cx0, float(uvd[1]) * bw + cy0],
+            dtype=float,
+        )
+        if not np.isfinite(joint_3d).all() or not np.isfinite(joint_2d).all():
+            continue
+        if abs(float(joint_3d[2])) <= 1e-8:
+            continue
+        rows_3d.append(joint_3d)
+        rows_2d.append(joint_2d)
+
+    if len(rows_3d) < 4:
+        raise RuntimeError("Not enough valid HybrIK joints to fit a camera projection.")
+
+    points_3d = np.stack(rows_3d, axis=0)
+    points_2d = np.stack(rows_2d, axis=0)
+    x_norm = points_3d[:, 0] / points_3d[:, 2]
+    y_norm = points_3d[:, 1] / points_3d[:, 2]
+
+    design = np.zeros((points_3d.shape[0] * 2, 3), dtype=float)
+    design[0::2, 0] = x_norm
+    design[0::2, 1] = 1.0
+    design[1::2, 0] = y_norm
+    design[1::2, 2] = 1.0
+    targets = np.empty(points_3d.shape[0] * 2, dtype=float)
+    targets[0::2] = points_2d[:, 0]
+    targets[1::2] = points_2d[:, 1]
+
+    solution, _, _, _ = np.linalg.lstsq(design, targets, rcond=None)
+    focal_px, cx_px, cy_px = [float(v) for v in solution]
+    fitted_2d = np.column_stack([focal_px * x_norm + cx_px, focal_px * y_norm + cy_px])
+    errors = np.linalg.norm(fitted_2d - points_2d, axis=1)
+
+    return {
+        "focal_px": focal_px,
+        "cx_px": cx_px,
+        "cy_px": cy_px,
+        "num_joints": int(points_3d.shape[0]),
+        "fit_mean_error_px": float(np.mean(errors)),
+        "fit_max_error_px": float(np.max(errors)),
+    }
+
+
+def project_points_pinhole(
+    points_3d: np.ndarray,
+    focal_px: float,
+    cx_px: float,
+    cy_px: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    pts = np.asarray(points_3d, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise RuntimeError("Expected points_3d to have shape (N, 3).")
+
+    z = pts[:, 2]
+    projected = np.full((pts.shape[0], 2), np.nan, dtype=float)
+    valid = np.isfinite(pts).all(axis=1) & (z > 1e-8)
+    if np.any(valid):
+        projected[valid, 0] = focal_px * (pts[valid, 0] / z[valid]) + cx_px
+        projected[valid, 1] = focal_px * (pts[valid, 1] / z[valid]) + cy_px
+    return projected, valid
+
+
+def render_projected_mesh_overlay(
+    image_bgr: np.ndarray,
+    vertices_3d: np.ndarray,
+    faces: np.ndarray,
+    focal_px: float,
+    cx_px: float,
+    cy_px: float,
+    alpha: float = 0.90,
+    base_color_bgr: Tuple[int, int, int] = (222, 206, 184),
+    outline_color_bgr: Tuple[int, int, int] = (154, 136, 113),
+    target_bbox_xyxy: Optional[Iterable[float]] = None,
+    target_fill_ratio: float = 0.98,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    if image_bgr is None or image_bgr.size == 0:
+        raise RuntimeError("Expected a valid BGR image for mesh overlay rendering.")
+
+    image_h, image_w = image_bgr.shape[:2]
+    verts_2d, valid_vertices = project_points_pinhole(vertices_3d, focal_px, cx_px, cy_px)
+    transform_debug: Dict[str, object] = {
+        "target_bbox_xyxy": None,
+        "target_fill_ratio": float(target_fill_ratio),
+        "overlay_scale": 1.0,
+        "overlay_shift_xy": [0.0, 0.0],
+    }
+
+    valid_points = verts_2d[valid_vertices]
+    if target_bbox_xyxy is not None and valid_points.size:
+        tx1, ty1, tx2, ty2 = [float(v) for v in target_bbox_xyxy]
+        mesh_min = valid_points.min(axis=0)
+        mesh_max = valid_points.max(axis=0)
+        mesh_size = np.maximum(mesh_max - mesh_min, 1e-6)
+        mesh_center = (mesh_min + mesh_max) / 2.0
+        target_center = np.array([(tx1 + tx2) / 2.0, (ty1 + ty2) / 2.0], dtype=float)
+        target_size = np.array([max(tx2 - tx1, 1e-6), max(ty2 - ty1, 1e-6)], dtype=float)
+        scale = float(min(target_size[0] / mesh_size[0], target_size[1] / mesh_size[1]) * target_fill_ratio)
+        verts_2d = (verts_2d - mesh_center[None, :]) * scale + target_center[None, :]
+        transform_debug = {
+            "target_bbox_xyxy": [tx1, ty1, tx2, ty2],
+            "target_fill_ratio": float(target_fill_ratio),
+            "overlay_scale": scale,
+            "overlay_shift_xy": (target_center - mesh_center * scale).tolist(),
+            "mesh_bbox_before_xyxy": [float(mesh_min[0]), float(mesh_min[1]), float(mesh_max[0]), float(mesh_max[1])],
+            "mesh_bbox_after_xyxy": [
+                float(np.nanmin(verts_2d[valid_vertices, 0])),
+                float(np.nanmin(verts_2d[valid_vertices, 1])),
+                float(np.nanmax(verts_2d[valid_vertices, 0])),
+                float(np.nanmax(verts_2d[valid_vertices, 1])),
+            ],
+        }
+
+    faces_arr = np.asarray(faces, dtype=np.int32)
+    if faces_arr.ndim != 2 or faces_arr.shape[1] != 3:
+        raise RuntimeError("Expected triangular faces with shape (M, 3).")
+
+    valid_faces = np.all(valid_vertices[faces_arr], axis=1)
+    if not np.any(valid_faces):
+        raise RuntimeError("No valid mesh faces remained after 3D projection.")
+
+    tri_3d = vertices_3d[faces_arr]
+    tri_2d = verts_2d[faces_arr]
+    normals = np.cross(tri_3d[:, 1] - tri_3d[:, 0], tri_3d[:, 2] - tri_3d[:, 0])
+    normal_mag = np.linalg.norm(normals, axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        facing = np.abs(normals[:, 2]) / normal_mag
+    facing = np.where(np.isfinite(facing), facing, 0.0)
+    depths = np.mean(tri_3d[:, :, 2], axis=1)
+    areas = 0.5 * np.abs(
+        tri_2d[:, 0, 0] * (tri_2d[:, 1, 1] - tri_2d[:, 2, 1])
+        + tri_2d[:, 1, 0] * (tri_2d[:, 2, 1] - tri_2d[:, 0, 1])
+        + tri_2d[:, 2, 0] * (tri_2d[:, 0, 1] - tri_2d[:, 1, 1])
+    )
+    valid_faces &= np.isfinite(depths) & np.isfinite(areas) & (areas > 0.5)
+
+    canvas = np.zeros_like(image_bgr)
+    mask = np.zeros((image_h, image_w), dtype=np.uint8)
+    draw_order = np.argsort(depths[valid_faces])[::-1]
+    face_indices = np.flatnonzero(valid_faces)[draw_order]
+    base_color = np.asarray(base_color_bgr, dtype=float)
+
+    for face_idx in face_indices:
+        tri = tri_2d[face_idx]
+        if not np.isfinite(tri).all():
+            continue
+        tri_int = np.round(tri).astype(np.int32)
+        if np.all(tri_int[:, 0] < 0) or np.all(tri_int[:, 0] >= image_w):
+            continue
+        if np.all(tri_int[:, 1] < 0) or np.all(tri_int[:, 1] >= image_h):
+            continue
+        intensity = 0.55 + 0.35 * float(facing[face_idx])
+        color = np.clip(base_color * intensity, 0, 255).astype(np.uint8).tolist()
+        cv2.fillConvexPoly(canvas, tri_int, color, lineType=cv2.LINE_AA)
+        cv2.fillConvexPoly(mask, tri_int, 255, lineType=cv2.LINE_AA)
+
+    if int(mask.sum()) == 0:
+        raise RuntimeError("Mesh projection produced an empty overlay mask.")
+
+    alpha_mask = (mask.astype(np.float32) / 255.0)[:, :, None] * float(np.clip(alpha, 0.0, 1.0))
+    blended = image_bgr.astype(np.float32) * (1.0 - alpha_mask) + canvas.astype(np.float32) * alpha_mask
+    blended = np.clip(blended, 0, 255).astype(np.uint8)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        cv2.drawContours(blended, contours, -1, outline_color_bgr, 1, lineType=cv2.LINE_AA)
+
+    return blended, {
+        "mask_area_px": int(np.count_nonzero(mask)),
+        "mask_area_ratio": float(np.count_nonzero(mask) / float(image_h * image_w)),
+        "num_faces_drawn": int(len(face_indices)),
+        "num_vertices_projected": int(np.count_nonzero(valid_vertices)),
+        **transform_debug,
+    }
+
+
+def render_hybrik_mesh_overlay(
+    image_or_path: Union[str, np.ndarray],
+    data_or_path: Union[str, Dict[str, object]],
+    mesh_obj_path: Optional[str] = None,
+    alpha: float = 0.90,
+    base_color_bgr: Tuple[int, int, int] = (222, 206, 184),
+    outline_color_bgr: Tuple[int, int, int] = (154, 136, 113),
+    fit_to_detector_bbox: bool = True,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    if isinstance(image_or_path, str):
+        image_bgr = cv2.imread(image_or_path)
+        if image_bgr is None:
+            raise RuntimeError(f"Failed to read image: {image_or_path}")
+        image_path = os.path.abspath(image_or_path)
+    else:
+        image_bgr = np.asarray(image_or_path).copy()
+        image_path = None
+
+    if mesh_obj_path is None:
+        if not isinstance(data_or_path, str):
+            raise RuntimeError("mesh_obj_path is required when HybrIK JSON is passed as an in-memory object.")
+        mesh_obj_path = os.path.join(os.path.dirname(os.path.abspath(data_or_path)), "mesh.obj")
+    if not os.path.exists(mesh_obj_path):
+        raise FileNotFoundError(f"Mesh OBJ not found: {mesh_obj_path}")
+
+    data = load_hybrik_json(data_or_path)
+    projection = fit_hybrik_projection(data)
+    translation = data.get("translation")
+    if not isinstance(translation, list) or len(translation) != 3:
+        raise RuntimeError("Expected `translation` in HybrIK JSON.")
+
+    vertices, faces = load_obj_mesh(mesh_obj_path)
+    vertices_cam = vertices + np.asarray(translation, dtype=float)[None, :]
+    target_bbox = None
+    if fit_to_detector_bbox:
+        bbox = data.get("detector_bbox_xyxy")
+        if isinstance(bbox, list) and len(bbox) == 4:
+            target_bbox = bbox
+    overlay_bgr, render_debug = render_projected_mesh_overlay(
+        image_bgr=image_bgr,
+        vertices_3d=vertices_cam,
+        faces=faces,
+        focal_px=projection["focal_px"],
+        cx_px=projection["cx_px"],
+        cy_px=projection["cy_px"],
+        alpha=alpha,
+        base_color_bgr=base_color_bgr,
+        outline_color_bgr=outline_color_bgr,
+        target_bbox_xyxy=target_bbox,
+    )
+    debug = {
+        "image_path": image_path,
+        "mesh_obj_path": os.path.abspath(mesh_obj_path),
+        "projection": projection,
+        "fit_to_detector_bbox": bool(fit_to_detector_bbox),
+        "vertices_count": int(vertices.shape[0]),
+        "faces_count": int(faces.shape[0]),
+        **render_debug,
+    }
+    return overlay_bgr, debug
+
+
+def load_pose_frame_points(
+    pose_csv: str,
+    frame_num: int,
+    image_w: int,
+    image_h: int,
+    use_coords: str = "smooth",
+) -> Dict[str, np.ndarray]:
+    df = pd.read_csv(pose_csv, encoding="utf-8-sig")
+    frame_df = df[df["frame"] == frame_num]
+    if frame_df.empty:
+        return {}
+
+    x_col = f"{use_coords}_x"
+    y_col = f"{use_coords}_y"
+    if x_col not in frame_df.columns or y_col not in frame_df.columns:
+        raise RuntimeError(f"Missing columns `{x_col}` and `{y_col}` in pose CSV.")
+
+    points: Dict[str, np.ndarray] = {}
+    for name, lm in HYBRIK_MP_JOINT_MAP.items():
+        row = frame_df[frame_df["lm"] == lm]
+        if row.empty:
+            continue
+        row0 = row.iloc[0]
+        x = float(row0[x_col]) * image_w
+        y = float(row0[y_col]) * image_h
+        if np.isfinite(x) and np.isfinite(y):
+            points[name] = np.array([x, y], dtype=float)
+    return points
+
+
+def compute_hybrik_pose_consistency(
+    hybrik_2d: Dict[str, np.ndarray],
+    pose_2d: Dict[str, np.ndarray],
+) -> Dict[str, object]:
+    rows = []
+    for name, pose_pt in pose_2d.items():
+        if name not in hybrik_2d:
+            continue
+        err = float(np.linalg.norm(hybrik_2d[name] - pose_pt))
+        rows.append(
+            {
+                "joint": name,
+                "error_px": err,
+                "hybrik_xy": hybrik_2d[name].tolist(),
+                "pose_xy": pose_pt.tolist(),
+            }
+        )
+
+    if not rows:
+        return {"num_compared": 0, "per_joint": []}
+
+    errors = np.array([row["error_px"] for row in rows], dtype=float)
+    return {
+        "num_compared": int(len(rows)),
+        "mean_error_px": float(np.mean(errors)),
+        "median_error_px": float(np.median(errors)),
+        "max_error_px": float(np.max(errors)),
+        "per_joint": rows,
+    }
+
+
+def compute_hybrik_confidence_stats(data_or_path: Union[str, Dict[str, object]]) -> Dict[str, float]:
+    scores = np.array(list(load_hybrik_joint_score_map(data_or_path).values()), dtype=float)
+    if scores.size == 0:
+        return {}
+    return {
+        "mean_score": float(np.mean(scores)),
+        "median_score": float(np.median(scores)),
+        "min_score": float(np.min(scores)),
+        "max_score": float(np.max(scores)),
+    }
+
+
+def compute_hybrik_coverage_stats(
+    hybrik_2d: Dict[str, np.ndarray],
+    data_or_path: Union[str, Dict[str, object]],
+    image_w: int,
+    image_h: int,
+) -> Dict[str, float]:
+    if not hybrik_2d:
+        return {}
+    data = load_hybrik_json(data_or_path)
+    bbox = data.get("detector_bbox_xyxy") or data.get("bbox_xyxy")
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        return {}
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+
+    inside_image = 0
+    inside_bbox = 0
+    for pt in hybrik_2d.values():
+        x, y = float(pt[0]), float(pt[1])
+        if 0 <= x < image_w and 0 <= y < image_h:
+            inside_image += 1
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            inside_bbox += 1
+    total = max(len(hybrik_2d), 1)
+    return {
+        "inside_image_ratio": inside_image / total,
+        "inside_detector_bbox_ratio": inside_bbox / total,
+    }
+
+
+def compute_hybrik_symmetry_stats(joints: Dict[str, np.ndarray]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for label, (la, lb, ra, rb) in HYBRIK_SYMMETRY_SEGMENTS.items():
+        if la not in joints or lb not in joints or ra not in joints or rb not in joints:
+            continue
+        left_len = float(np.linalg.norm(joints[lb] - joints[la]))
+        right_len = float(np.linalg.norm(joints[rb] - joints[ra]))
+        out[f"{label}_left_len"] = left_len
+        out[f"{label}_right_len"] = right_len
+        if min(left_len, right_len) > 1e-8:
+            out[f"{label}_symmetry_ratio"] = max(left_len, right_len) / min(left_len, right_len)
+    return out
+
+
+def compute_hybrik_neighbor_stability(
+    neighbor_jsons: List[Tuple[int, Union[str, Dict[str, object]]]]
+) -> Dict[str, object]:
+    if len(neighbor_jsons) < 2:
+        return {}
+
+    per_frame = []
+    all_joint_arrays: List[np.ndarray] = []
+    joint_order: Optional[List[str]] = None
+
+    for frame_num, payload in neighbor_jsons:
+        metrics_3d, _debug = analyze_trophy_pose_3d(payload)
+        joints = load_hybrik_joint_xyz_map(payload)
+        if joint_order is None:
+            joint_order = sorted(joints.keys())
+        arr = np.stack([joints[name] for name in joint_order], axis=0)
+        all_joint_arrays.append(arr)
+        per_frame.append({"frame": int(frame_num), **metrics_3d})
+
+    disp = []
+    for prev, curr in zip(all_joint_arrays[:-1], all_joint_arrays[1:]):
+        disp.append(float(np.mean(np.linalg.norm(curr - prev, axis=1))))
+
+    stability = {
+        "frames": [row["frame"] for row in per_frame],
+        "per_frame_metrics": per_frame,
+        "mean_consecutive_joint_disp": float(np.mean(disp)),
+        "max_consecutive_joint_disp": float(np.max(disp)),
+    }
+    for key in HYBRIK_3D_ANGLE_KEYS:
+        values = np.array([row.get(key, float("nan")) for row in per_frame], dtype=float)
+        finite = values[np.isfinite(values)]
+        if finite.size:
+            stability[f"{key}_std"] = float(np.std(finite))
+            stability[f"{key}_range"] = float(np.max(finite) - np.min(finite))
+    return stability
+
+
+def build_hybrik_warnings(
+    confidence: Dict[str, float],
+    consistency: Dict[str, object],
+    symmetry: Dict[str, float],
+    stability: Dict[str, object],
+) -> List[str]:
+    warnings: List[str] = []
+    mean_score = confidence.get("mean_score")
+    if mean_score is not None and mean_score < 0.03:
+        warnings.append("HybrIK joint confidence is low; inspect overlay and mesh before trusting angles.")
+
+    mean_err = consistency.get("mean_error_px")
+    if isinstance(mean_err, (int, float)) and mean_err > 40:
+        warnings.append("HybrIK 2D reprojection differs noticeably from pose CSV on the selected frame.")
+
+    for key, value in symmetry.items():
+        if key.endswith("_symmetry_ratio") and value > 1.25:
+            warnings.append(f"Left/right limb length asymmetry looks high for {key}.")
+
+    elbow_std = stability.get("right_elbow_angle_deg_std")
+    if isinstance(elbow_std, (int, float)) and elbow_std > 10:
+        warnings.append("Neighboring-frame elbow angle varies a lot around the target frame.")
+
+    # Single-frame SMPL body shape is easy to over-interpret. Keep that explicit in the summary.
+    warnings.append("Single-frame HybrIK body shape is not trustworthy; use skeleton and joint angles, not chest/body contour, for coaching.")
+    return warnings
+
+
+def _parse_frame_num_from_paths(explicit: Optional[int], *paths: Optional[str]) -> Optional[int]:
+    if explicit is not None:
+        return int(explicit)
+    for source in paths:
+        if not source:
+            continue
+        name = os.path.basename(source)
+        match = re.search(r"(\d+)(?=\.[^.]+$)", name)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def summarize_hybrik_verification(
+    json_or_path: Union[str, Dict[str, object]],
+    image_size: Optional[Tuple[int, int]] = None,
+    pose_points_2d: Optional[Dict[str, np.ndarray]] = None,
+    neighbor_jsons: Optional[List[Tuple[int, Union[str, Dict[str, object]]]]] = None,
+    frame_num: Optional[int] = None,
+    pose_csv_path: Optional[str] = None,
+    image_path: Optional[str] = None,
+    body_shape_model: str = "smpl_neutral_single_frame",
+) -> Dict[str, object]:
+    data = load_hybrik_json(json_or_path)
+    joints = load_hybrik_joint_xyz_map(data)
+    angles_3d, debug_3d = analyze_trophy_pose_3d(data)
+    hybrik_2d = project_hybrik_joints_2d(data)
+    confidence = compute_hybrik_confidence_stats(data)
+    symmetry = compute_hybrik_symmetry_stats(joints)
+
+    consistency: Dict[str, object] = {"num_compared": 0, "per_joint": []}
+    if pose_points_2d:
+        consistency = compute_hybrik_pose_consistency(hybrik_2d, pose_points_2d)
+
+    coverage: Dict[str, float] = {}
+    if image_size is not None:
+        image_w, image_h = image_size
+        coverage = compute_hybrik_coverage_stats(hybrik_2d, data, image_w, image_h)
+
+    stability = compute_hybrik_neighbor_stability(neighbor_jsons or [])
+    warnings = build_hybrik_warnings(confidence, consistency, symmetry, stability)
+
+    verdict = "good"
+    if warnings:
+        verdict = "caution"
+    if any("differs noticeably" in item or "varies a lot" in item for item in warnings):
+        verdict = "needs_review"
+
+    if image_path is None and isinstance(json_or_path, str):
+        image_path = data.get("image_path") if isinstance(data.get("image_path"), str) else None
+    if frame_num is None:
+        frame_num = _parse_frame_num_from_paths(
+            None,
+            image_path,
+            json_or_path if isinstance(json_or_path, str) else None,
+        )
+
+    return {
+        "verdict": verdict,
+        "angles_3d": angles_3d,
+        "angles_debug": debug_3d,
+        "confidence": confidence,
+        "coverage": coverage,
+        "symmetry": symmetry,
+        "pose_consistency": consistency,
+        "stability": stability,
+        "warnings": warnings,
+        "body_shape_model": body_shape_model,
+        "body_shape_trust": "low",
+        "inputs": {
+            "json_path": os.path.abspath(json_or_path) if isinstance(json_or_path, str) else None,
+            "image_path": os.path.abspath(image_path) if image_path else None,
+            "pose_csv": os.path.abspath(pose_csv_path) if pose_csv_path else None,
+            "frame_num": frame_num,
+        },
     }

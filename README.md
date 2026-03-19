@@ -1,26 +1,38 @@
 ---
-# 详细文档见https://modelscope.cn/docs/%E5%88%9B%E7%A9%BA%E9%97%B4%E5%8D%A1%E7%89%87
-domain: #领域：cv/nlp/audio/multi-modal/AutoML
-# - cv
-tags: #自定义标签
--
-datasets: #关联数据集
-  evaluation:
-  #- iic/ICDAR13_HCTR_Dataset
-  test:
-  #- iic/MTWI
-  train:
-  #- iic/SIBR
-models: #关联模型
-#- iic/ofa_ocr-recognition_general_base_zh
-
-## 启动文件(若SDK为Gradio/Streamlit，默认为app.py, 若为Static HTML, 默认为index.html)
-# deployspec:
-#   entry_file: app.py
-license: Apache License 2.0
+title: Serve AI Tracker
+sdk: gradio
+sdk_version: 4.x.x
+app_file: app.py
 python_version: "3.10"
 ---
-#### Clone with HTTP
-```bash
- git clone https://www.modelscope.cn/studios/legendary001/Serve-AI-Tracker.git
+
+# Serve_Score (这里往下保留你原本写的说明文字)
+---
+title: Serve AI Tracker
+emoji: 🎾
+colorFrom: blue
+colorTo: green
+sdk: gradio
+sdk_version: 4.x.x
+app_file: app.py
+pinned: false
+python_version: "3.10"
+---
+
+# Serve_Score
+
+Short serve-clip scoring pipeline (pose extraction + scoring report).
+
+## Quick Start (Scoring Report)
+
+
+# Serve_Score
+
+
+Short serve-clip scoring pipeline (pose extraction + scoring report).
+
+## Quick Start (Scoring Report)
+```
+conda activate servepose
+python make_report.py --video D:\Serve_Score\input\serve.mp4 --out_dir D:\Serve_Score\out\serve_report
 ```
