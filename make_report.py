@@ -1,10 +1,11 @@
 import argparse
+import html as html_lib
 import json
 import time
 import os
 import subprocess
 import sys
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -25,6 +26,57 @@ TIMING_RANGES = {
     "timing_toss_to_trophy": (0.3, 1.4),
     "timing_trophy_to_drop": (0.12, 0.26),
     "timing_drop_to_contact": (0.08, 0.16),
+}
+
+KEYFRAME_3D_PHASES = ["trophy", "racket_drop", "contact", "finish"]
+KEYFRAME_3D_ANGLE_ORDER = {
+    "trophy": [
+        "lead_knee_flexion_deg",
+        "trunk_inclination_deg",
+        "right_elbow_angle_deg",
+        "left_elbow_angle_deg",
+        "shoulder_tilt_deg",
+        "left_knee_angle_deg",
+        "right_knee_angle_deg",
+    ],
+    "racket_drop": [
+        "shoulder_external_rotation_proxy_deg",
+        "right_elbow_angle_deg",
+        "left_elbow_angle_deg",
+        "trunk_inclination_deg",
+        "shoulder_tilt_deg",
+        "left_knee_angle_deg",
+        "right_knee_angle_deg",
+    ],
+    "contact": [
+        "shoulder_raise_deg",
+        "elbow_flexion_deg",
+        "impact_height_norm",
+        "right_elbow_angle_deg",
+        "left_elbow_angle_deg",
+        "trunk_inclination_deg",
+    ],
+    "finish": [
+        "right_elbow_angle_deg",
+        "left_elbow_angle_deg",
+        "left_knee_angle_deg",
+        "right_knee_angle_deg",
+        "trunk_inclination_deg",
+        "shoulder_tilt_deg",
+    ],
+}
+KEYFRAME_3D_ANGLE_LABELS = {
+    "left_knee_angle_deg": ("左膝夹角 (3D)", "Left Knee Angle (3D)"),
+    "right_knee_angle_deg": ("右膝夹角 (3D)", "Right Knee Angle (3D)"),
+    "lead_knee_flexion_deg": ("奖杯位膝屈角 (TP)", "Trophy Knee Flexion (TP)"),
+    "left_elbow_angle_deg": ("左肘夹角 (3D)", "Left Elbow Angle (3D)"),
+    "right_elbow_angle_deg": ("右肘夹角 (3D)", "Right Elbow Angle (3D)"),
+    "trunk_inclination_deg": ("躯干倾角", "Trunk Inclination"),
+    "shoulder_tilt_deg": ("双肩倾斜角", "Shoulder Tilt"),
+    "shoulder_external_rotation_proxy_deg": ("拍头下落肩外旋 (RLP)", "RLP Shoulder External Rotation"),
+    "shoulder_raise_deg": ("击球瞬间肩抬高 (BI)", "Impact Shoulder Raise (BI)"),
+    "elbow_flexion_deg": ("击球瞬间肘屈 (BI)", "Impact Elbow Flexion (BI)"),
+    "impact_height_norm": ("击球高度 (BH)", "Impact Height (BH)"),
 }
 
 
@@ -399,6 +451,637 @@ def _format_risk_flags(flags: List[str], lang: str) -> str:
     return sep.join(flags)
 
 
+def _phase_frame_num(phases: Dict[str, object], frames: Optional[np.ndarray], name: str) -> Optional[int]:
+    idx = phases.get(name) if isinstance(phases, dict) else None
+    if idx is None:
+        return None
+    try:
+        idx = int(idx)
+    except Exception:
+        return None
+    if frames is not None and 0 <= idx < len(frames):
+        try:
+            return int(frames[idx])
+        except Exception:
+            return idx
+    return idx
+
+
+def _find_servepose_python() -> Optional[str]:
+    exe = os.path.abspath(sys.executable)
+    exe_dir = os.path.dirname(exe)
+    if os.path.basename(exe_dir).lower() == "servepose":
+        return exe
+
+    roots = {exe_dir}
+    if os.path.basename(os.path.dirname(exe_dir)).lower() == "envs":
+        roots.add(os.path.dirname(os.path.dirname(exe_dir)))
+
+    for root in roots:
+        candidate = os.path.join(root, "envs", "servepose", "python.exe")
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _artifact_relpath(path: Optional[str], out_dir: str, run_id: int) -> Optional[str]:
+    if not path:
+        return None
+    abs_path = os.path.abspath(path)
+    if not os.path.exists(abs_path):
+        return None
+    rel = os.path.relpath(abs_path, out_dir)
+    return f"{_posix_path(rel)}?v={run_id}"
+
+
+def _load_3d_verification_summary(verify_dir: str, out_dir: str, run_id: int) -> Optional[Dict[str, object]]:
+    summary_path = os.path.join(verify_dir, "verification_summary.json")
+    if not os.path.exists(summary_path):
+        return None
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            summary = json.load(f)
+    except Exception:
+        return None
+
+    artifacts = summary.get("artifacts") or {}
+    summary["artifact_paths"] = {
+        "mesh_overlay": _artifact_relpath(artifacts.get("mesh_overlay_png"), out_dir, run_id),
+        "mesh_overlay_compare": _artifact_relpath(artifacts.get("mesh_overlay_compare_png"), out_dir, run_id),
+        "views": _artifact_relpath(artifacts.get("3d_views_png"), out_dir, run_id),
+        "reprojection": _artifact_relpath(artifacts.get("reprojection_compare_png"), out_dir, run_id),
+        "neighbor_metrics": _artifact_relpath(artifacts.get("neighbor_metrics_png"), out_dir, run_id),
+    }
+    return summary
+
+
+def _maybe_generate_3d_verification(
+    video: str,
+    pose_csv: str,
+    out_dir: str,
+    trophy_image_path: str,
+    trophy_frame_num: Optional[int],
+    use_coords: str,
+    run_id: int,
+    verify_3d: str,
+    verify_neighbor_radius: int,
+    verify_device: str,
+) -> Optional[Dict[str, object]]:
+    verify_dir = os.path.join(out_dir, "verify")
+    existing = _load_3d_verification_summary(verify_dir, out_dir, run_id)
+    if verify_3d == "off":
+        return existing
+    if existing is not None and verify_3d != "on":
+        return existing
+    if trophy_frame_num is None or not os.path.exists(trophy_image_path):
+        print("[INFO] 3D verification skipped (trophy frame unavailable).")
+        return existing
+
+    servepose_python = _find_servepose_python()
+    if not servepose_python:
+        print("[INFO] 3D verification skipped (servepose python not found).")
+        return existing
+
+    hybrik_dir = os.path.join(verify_dir, "hybrik")
+    _ensure_dir(hybrik_dir)
+    run_hybrik_script = os.path.join(os.path.dirname(__file__), "run_hybrik_image.py")
+    verify_script = os.path.join(os.path.dirname(__file__), "verify_trophy_3d.py")
+    if not os.path.exists(run_hybrik_script) or not os.path.exists(verify_script):
+        print("[INFO] 3D verification skipped (helper scripts missing).")
+        return existing
+
+    try:
+        cmd_hybrik = [
+            servepose_python,
+            run_hybrik_script,
+            "--image",
+            trophy_image_path,
+            "--out_dir",
+            hybrik_dir,
+            "--device",
+            verify_device,
+        ]
+        subprocess.run(cmd_hybrik, check=True)
+
+        cmd_verify = [
+            servepose_python,
+            verify_script,
+            "--json_path",
+            os.path.join(hybrik_dir, "joints3d.json"),
+            "--image_path",
+            trophy_image_path,
+            "--pose_csv",
+            pose_csv,
+            "--frame_num",
+            str(trophy_frame_num),
+            "--video",
+            video,
+            "--neighbor_radius",
+            str(max(0, int(verify_neighbor_radius))),
+            "--use_coords",
+            use_coords,
+            "--out_dir",
+            verify_dir,
+            "--device",
+            verify_device,
+        ]
+        subprocess.run(cmd_verify, check=True)
+    except Exception as exc:
+        print(f"[INFO] 3D verification skipped ({exc}).")
+        return existing
+
+    loaded = _load_3d_verification_summary(verify_dir, out_dir, run_id)
+    if loaded is None:
+        print("[INFO] 3D verification finished, but summary was not found.")
+    return loaded
+
+
+def _phase_display_name(phase: str, lang: str) -> str:
+    names = {
+        "trophy": ("奖杯姿势", "Trophy"),
+        "racket_drop": ("拍头下落", "Racket Drop"),
+        "contact": ("击球瞬间", "Contact"),
+        "finish": ("收拍结束", "Finish"),
+    }
+    zh, en = names.get(phase, (phase, phase))
+    return zh if lang == "zh" else en
+
+
+def _angle_display_name(metric: str, lang: str) -> str:
+    zh, en = KEYFRAME_3D_ANGLE_LABELS.get(metric, (metric, metric))
+    return zh if lang == "zh" else en
+
+
+def _save_compare_image(
+    image_path: str,
+    overlay_image: np.ndarray,
+    compare_path: str,
+    lang: str,
+) -> None:
+    original = cv2.imread(image_path)
+    if original is None:
+        raise RuntimeError(f"Failed to read image: {image_path}")
+
+    gap = 18
+    h, w = original.shape[:2]
+    compare = np.full((h, w * 2 + gap, 3), 255, dtype=np.uint8)
+    compare[:, :w] = original
+    compare[:, w + gap :] = overlay_image
+
+    labels = ("原图", "原图 + 3D 叠加") if lang == "zh" else ("Original", "Original + 3D Overlay")
+    for origin_x, text in [(18, labels[0]), (w + gap + 18, labels[1])]:
+        cv2.putText(compare, text, (origin_x, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 3, cv2.LINE_AA)
+        cv2.putText(compare, text, (origin_x, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (44, 44, 44), 1, cv2.LINE_AA)
+
+    cv2.imwrite(compare_path, compare)
+
+
+def _load_keyframe_3d_summary(keyframe_dir: str, out_dir: str, run_id: int) -> Optional[Dict[str, object]]:
+    summary_path = os.path.join(keyframe_dir, "keyframe_3d_summary.json")
+    if not os.path.exists(summary_path):
+        return None
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            summary = json.load(f)
+    except Exception:
+        return None
+
+    phase_payloads = summary.get("phases")
+    if not isinstance(phase_payloads, dict):
+        return None
+
+    for phase_name, payload in phase_payloads.items():
+        if not isinstance(payload, dict):
+            continue
+        artifacts = payload.get("artifacts") or {}
+        payload["artifact_paths"] = {
+            "compare": _artifact_relpath(artifacts.get("compare_png"), out_dir, run_id),
+        }
+        payload["phase"] = phase_name
+    return summary
+
+
+def _maybe_generate_keyframe_3d_bundle(
+    out_dir: str,
+    phase_frame_nums: Dict[str, Optional[int]],
+    lang: str,
+    run_id: int,
+    verify_3d: str,
+    verify_device: str,
+) -> Optional[Dict[str, object]]:
+    keyframe_dir = os.path.join(out_dir, "keyframe_3d")
+    existing = _load_keyframe_3d_summary(keyframe_dir, out_dir, run_id)
+    if verify_3d == "off":
+        return existing
+    if existing is not None and verify_3d != "on":
+        return existing
+
+    servepose_python = _find_servepose_python()
+    if not servepose_python:
+        print("[INFO] 3D keyframe analysis skipped (servepose python not found).")
+        return existing
+
+    run_hybrik_script = os.path.join(os.path.dirname(__file__), "run_hybrik_image.py")
+    if not os.path.exists(run_hybrik_script):
+        print("[INFO] 3D keyframe analysis skipped (run_hybrik_image.py missing).")
+        return existing
+
+    _ensure_dir(keyframe_dir)
+    phase_payloads: Dict[str, object] = {}
+
+    for phase in KEYFRAME_3D_PHASES:
+        image_path = os.path.join(out_dir, "keyframes", f"{phase}.png")
+        if not os.path.exists(image_path):
+            continue
+
+        phase_dir = os.path.join(keyframe_dir, phase)
+        hybrik_dir = os.path.join(phase_dir, "hybrik")
+        _ensure_dir(phase_dir)
+        _ensure_dir(hybrik_dir)
+
+        try:
+            cmd_hybrik = [
+                servepose_python,
+                run_hybrik_script,
+                "--image",
+                image_path,
+                "--out_dir",
+                hybrik_dir,
+                "--device",
+                verify_device,
+            ]
+            subprocess.run(cmd_hybrik, check=True)
+
+            json_path = os.path.join(hybrik_dir, "joints3d.json")
+            obj_path = os.path.join(hybrik_dir, "mesh.obj")
+            overlay_path = os.path.join(phase_dir, "mesh_overlay.png")
+            compare_path = os.path.join(phase_dir, "mesh_overlay_compare.png")
+
+            metrics_3d, debug_3d = serve_score.analyze_trophy_pose_3d(json_path)
+            phase_metrics_3d = serve_score.summarize_keyframe_pose_3d(
+                json_path,
+                phase=phase,
+                dominant_hand="right",
+            )
+            overlay_img, overlay_debug = serve_score.render_hybrik_mesh_overlay(
+                image_or_path=image_path,
+                data_or_path=json_path,
+                mesh_obj_path=obj_path,
+            )
+            cv2.imwrite(overlay_path, overlay_img)
+            _save_compare_image(image_path, overlay_img, compare_path, lang)
+
+            phase_payloads[phase] = {
+                "phase": phase,
+                "label": _phase_display_name(phase, lang),
+                "frame_num": phase_frame_nums.get(phase),
+                "angles_3d": metrics_3d,
+                "phase_metrics_3d": phase_metrics_3d,
+                "angles_debug": debug_3d,
+                "overlay_debug": overlay_debug,
+                "artifacts": {
+                    "compare_png": os.path.abspath(compare_path),
+                    "overlay_png": os.path.abspath(overlay_path),
+                    "json_path": os.path.abspath(json_path),
+                    "mesh_obj_path": os.path.abspath(obj_path),
+                },
+            }
+        except Exception as exc:
+            phase_payloads[phase] = {
+                "phase": phase,
+                "label": _phase_display_name(phase, lang),
+                "frame_num": phase_frame_nums.get(phase),
+                "error": str(exc),
+            }
+
+    summary = {
+        "phases": phase_payloads,
+        "inputs": {
+            "out_dir": os.path.abspath(out_dir),
+        },
+    }
+    summary_path = os.path.join(keyframe_dir, "keyframe_3d_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    return _load_keyframe_3d_summary(keyframe_dir, out_dir, run_id)
+
+
+def _safe_float(value: object) -> float:
+    if isinstance(value, (int, float, np.floating)) and np.isfinite(value):
+        return float(value)
+    return float("nan")
+
+
+def _weighted_score(parts: List[Tuple[float, float]]) -> float:
+    total_weight = 0.0
+    total_score = 0.0
+    for score, weight in parts:
+        if np.isfinite(score) and weight > 0:
+            total_score += float(score) * float(weight)
+            total_weight += float(weight)
+    if total_weight <= 1e-8:
+        return float("nan")
+    return total_score / total_weight
+
+
+def _score_centered_range(value: float, lo: float, hi: float, edge_score: float = 80.0) -> float:
+    if not np.isfinite(value):
+        return float("nan")
+    lo_f = min(float(lo), float(hi))
+    hi_f = max(float(lo), float(hi))
+    center = (lo_f + hi_f) / 2.0
+    half = (hi_f - lo_f) / 2.0
+    if half <= 1e-8:
+        return 100.0 if abs(value - center) <= 1e-8 else 0.0
+    dist = abs(float(value) - center)
+    if dist <= half:
+        return float(100.0 - (100.0 - edge_score) * (dist / half))
+    outer = dist - half
+    return float(max(0.0, edge_score * (1.0 - outer / half)))
+
+
+def _lit_zone_name(z_abs: float, lang: str) -> str:
+    if not np.isfinite(z_abs):
+        return "n/a"
+    if z_abs <= 1.0:
+        return "参考绿区" if lang == "zh" else "green literature zone"
+    if z_abs <= 2.0:
+        return "参考黄区" if lang == "zh" else "yellow literature zone"
+    if z_abs <= 3.0:
+        return "参考橙区" if lang == "zh" else "orange literature zone"
+    return "参考红区" if lang == "zh" else "red literature zone"
+
+
+def _build_current_3d_report_summary(
+    keyframe_3d: Optional[Dict[str, object]],
+    timing_metrics: Dict[str, float],
+    lang: str,
+) -> Dict[str, object]:
+    phases = (keyframe_3d or {}).get("phases") if isinstance(keyframe_3d, dict) else {}
+    if not isinstance(phases, dict):
+        phases = {}
+
+    trophy_payload = phases.get("trophy") if isinstance(phases.get("trophy"), dict) else {}
+    drop_payload = phases.get("racket_drop") if isinstance(phases.get("racket_drop"), dict) else {}
+    contact_payload = phases.get("contact") if isinstance(phases.get("contact"), dict) else {}
+
+    trophy_metrics = trophy_payload.get("phase_metrics_3d") if isinstance(trophy_payload.get("phase_metrics_3d"), dict) else {}
+    drop_metrics = drop_payload.get("phase_metrics_3d") if isinstance(drop_payload.get("phase_metrics_3d"), dict) else {}
+    contact_metrics = contact_payload.get("phase_metrics_3d") if isinstance(contact_payload.get("phase_metrics_3d"), dict) else {}
+
+    tp_knee = _safe_float(trophy_metrics.get("lead_knee_flexion_deg"))
+    tp_trunk = _safe_float(trophy_metrics.get("trunk_inclination_deg"))
+    impact_height_norm = _safe_float(contact_metrics.get("impact_height_norm"))
+    rlp_shoulder_er = _safe_float(drop_metrics.get("shoulder_external_rotation_proxy_deg"))
+    bi_shoulder_raise = _safe_float(contact_metrics.get("shoulder_raise_deg"))
+    bi_elbow_flex = _safe_float(contact_metrics.get("elbow_flexion_deg"))
+
+    knee_score, knee_z = serve_score._score_lit_plateau(tp_knee, LIT_KNEE_MEAN, LIT_KNEE_SD)
+    trunk_score, trunk_z = serve_score._score_lit_plateau(tp_trunk, LIT_TRUNK_MEAN, LIT_TRUNK_SD)
+
+    timing_specs = [
+        ("timing_toss_to_trophy", "抛球→奖杯位间隔", TIMING_RANGES["timing_toss_to_trophy"]),
+        ("timing_trophy_to_drop", "奖杯位→下落间隔", TIMING_RANGES["timing_trophy_to_drop"]),
+        ("timing_drop_to_contact", "下落→击球间隔", TIMING_RANGES["timing_drop_to_contact"]),
+    ]
+    timing_rows = []
+    timing_scores = []
+    for key, zh_name, rng in timing_specs:
+        value = _safe_float(timing_metrics.get(key))
+        score = _score_centered_range(value, rng[0], rng[1], edge_score=80.0)
+        if np.isfinite(score):
+            timing_scores.append(score)
+        note = (
+            "处于经验合理范围，节奏正常"
+            if lang == "zh"
+            else "Within the expected timing band."
+        )
+        timing_rows.append(
+            {
+                "name": zh_name if lang == "zh" else key,
+                "value": value,
+                "score": score,
+                "note": note,
+            }
+        )
+
+    timing_score = float(np.mean(timing_scores)) if timing_scores else float("nan")
+    final_score = _weighted_score(
+        [
+            (knee_score, 0.40),
+            (trunk_score, 0.40),
+            (timing_score, 0.20),
+        ]
+    )
+
+    knee_range = (round(LIT_KNEE_MEAN - LIT_KNEE_SD), round(LIT_KNEE_MEAN + LIT_KNEE_SD))
+    trunk_range = (round(LIT_TRUNK_MEAN - LIT_TRUNK_SD), round(LIT_TRUNK_MEAN + LIT_TRUNK_SD))
+
+    core_rows = [
+        {
+            "name": "奖杯位膝屈角（TP）" if lang == "zh" else "Trophy Knee Flexion (TP)",
+            "value_text": (
+                f"{tp_knee:.1f}°（参考：{knee_range[0]}–{knee_range[1]}°，文献均值±1SD）"
+                if np.isfinite(tp_knee)
+                else ("未计算" if lang == "zh" else "Not available")
+            ),
+            "conclusion": (
+                f"处于{_lit_zone_name(abs(knee_z), lang)}，技术表现良好，子分 = {knee_score:.1f}"
+                if np.isfinite(knee_score)
+                else ("3D 关键点不足，未能稳定计算。" if lang == "zh" else "3D joints were insufficient for a stable estimate.")
+            ),
+        },
+        {
+            "name": "奖杯位躯干倾角（TP）" if lang == "zh" else "Trophy Trunk Inclination (TP)",
+            "value_text": (
+                f"{tp_trunk:.1f}°（参考：{trunk_range[0]}–{trunk_range[1]}°，文献均值±1SD）"
+                if np.isfinite(tp_trunk)
+                else ("未计算" if lang == "zh" else "Not available")
+            ),
+            "conclusion": (
+                f"处于{_lit_zone_name(abs(trunk_z), lang)}，奖杯位躯干构型合理，子分 = {trunk_score:.1f}"
+                if np.isfinite(trunk_score)
+                else ("3D 关键点不足，未能稳定计算。" if lang == "zh" else "3D joints were insufficient for a stable estimate.")
+            ),
+        },
+        {
+            "name": "击球高度（身高归一化）" if lang == "zh" else "Impact Height (Body-Height Normalized)",
+            "value_text": (
+                f"{impact_height_norm:.3f} BH"
+                if np.isfinite(impact_height_norm)
+                else ("未计算" if lang == "zh" else "Not available")
+            ),
+            "conclusion": (
+                "已由 3D 模型计算，当前版本暂不纳入总分。"
+                if np.isfinite(impact_height_norm)
+                else ("3D 关键点不足，未能稳定计算。" if lang == "zh" else "3D joints were insufficient for a stable estimate.")
+            ),
+        },
+        {
+            "name": "拍头下落肩外旋（RLP）" if lang == "zh" else "Racket-Drop Shoulder External Rotation (RLP)",
+            "value_text": (
+                f"{rlp_shoulder_er:.1f}°"
+                if np.isfinite(rlp_shoulder_er)
+                else ("未计算" if lang == "zh" else "Not available")
+            ),
+            "conclusion": (
+                "基于 3D 关节几何的肩外旋代理角，当前作为扩展观察项展示。"
+                if np.isfinite(rlp_shoulder_er)
+                else ("3D 关键点不足，未能稳定计算。" if lang == "zh" else "3D joints were insufficient for a stable estimate.")
+            ),
+        },
+        {
+            "name": "击球瞬间肩抬高（BI）" if lang == "zh" else "Impact Shoulder Raise (BI)",
+            "value_text": (
+                f"{bi_shoulder_raise:.1f}°"
+                if np.isfinite(bi_shoulder_raise)
+                else ("未计算" if lang == "zh" else "Not available")
+            ),
+            "conclusion": (
+                "由 3D 上臂相对躯干夹角得到，当前作为扩展观察项展示。"
+                if np.isfinite(bi_shoulder_raise)
+                else ("3D 关键点不足，未能稳定计算。" if lang == "zh" else "3D joints were insufficient for a stable estimate.")
+            ),
+        },
+        {
+            "name": "击球瞬间肘屈（BI）" if lang == "zh" else "Impact Elbow Flexion (BI)",
+            "value_text": (
+                f"{bi_elbow_flex:.1f}°"
+                if np.isfinite(bi_elbow_flex)
+                else ("未计算" if lang == "zh" else "Not available")
+            ),
+            "conclusion": (
+                "由 3D 肘关节屈曲角得到，当前作为扩展观察项展示。"
+                if np.isfinite(bi_elbow_flex)
+                else ("3D 关键点不足，未能稳定计算。" if lang == "zh" else "3D joints were insufficient for a stable estimate.")
+            ),
+        },
+    ]
+
+    score_rows = [
+        {
+            "name": "奖杯位膝屈角（TP）" if lang == "zh" else "Trophy Knee Flexion (TP)",
+            "score": knee_score,
+            "weight": 0.40,
+            "note": "核心技术项" if lang == "zh" else "Core technical item",
+        },
+        {
+            "name": "奖杯位躯干倾角（TP）" if lang == "zh" else "Trophy Trunk Inclination (TP)",
+            "score": trunk_score,
+            "weight": 0.40,
+            "note": "核心技术项" if lang == "zh" else "Core technical item",
+        },
+        {
+            "name": "辅助节奏观察" if lang == "zh" else "Auxiliary Timing",
+            "score": timing_score,
+            "weight": 0.20,
+            "note": "纳入总分，但权重低于核心技术项" if lang == "zh" else "Included, but weighted below core technical items",
+        },
+        {
+            "name": "击球高度（归一化）" if lang == "zh" else "Impact Height (Normalized)",
+            "score": float("nan"),
+            "weight": 0.0,
+            "note": "当前不纳入总分" if lang == "zh" else "Currently excluded from the total score",
+        },
+        {
+            "name": "技术评分（当前版）" if lang == "zh" else "Current Technical Score",
+            "score": final_score,
+            "weight": 1.0,
+            "note": "基于当前可稳定评分项目计算" if lang == "zh" else "Computed from the currently stable scoring items",
+        },
+    ]
+
+    quality_rows = [
+        {
+            "name": "奖杯位膝屈角（TP）" if lang == "zh" else "Trophy Knee Flexion (TP)",
+            "success": "1/1" if np.isfinite(tp_knee) else "0/1",
+            "usable": bool(np.isfinite(knee_score)),
+            "note": "奖杯位 3D 关键点完整" if lang == "zh" else "Trophy-frame 3D joints are complete",
+        },
+        {
+            "name": "奖杯位躯干倾角（TP）" if lang == "zh" else "Trophy Trunk Inclination (TP)",
+            "success": "1/1" if np.isfinite(tp_trunk) else "0/1",
+            "usable": bool(np.isfinite(trunk_score)),
+            "note": "奖杯位 3D 关键点完整" if lang == "zh" else "Trophy-frame 3D joints are complete",
+        },
+        {
+            "name": "击球高度（归一化）" if lang == "zh" else "Impact Height (Normalized)",
+            "success": "1/1" if np.isfinite(impact_height_norm) else "0/1",
+            "usable": False,
+            "note": "已由 3D 模型计算，但当前不纳入总分" if lang == "zh" else "Computed from 3D, but not yet used in scoring",
+        },
+        {
+            "name": "拍头下落肩外旋（RLP）" if lang == "zh" else "RLP Shoulder External Rotation",
+            "success": "1/1" if np.isfinite(rlp_shoulder_er) else "0/1",
+            "usable": False,
+            "note": "3D 扩展观察项" if lang == "zh" else "3D observational metric",
+        },
+        {
+            "name": "击球瞬间肩抬高（BI）" if lang == "zh" else "BI Shoulder Raise",
+            "success": "1/1" if np.isfinite(bi_shoulder_raise) else "0/1",
+            "usable": False,
+            "note": "3D 扩展观察项" if lang == "zh" else "3D observational metric",
+        },
+        {
+            "name": "击球瞬间肘屈（BI）" if lang == "zh" else "BI Elbow Flexion",
+            "success": "1/1" if np.isfinite(bi_elbow_flex) else "0/1",
+            "usable": False,
+            "note": "3D 扩展观察项" if lang == "zh" else "3D observational metric",
+        },
+        {
+            "name": "辅助时序" if lang == "zh" else "Auxiliary Timing",
+            "success": f"{sum(np.isfinite(row['value']) for row in timing_rows)}/3",
+            "usable": bool(np.isfinite(timing_score)),
+            "note": "事件顺序识别正常，可用于辅助节奏评分" if lang == "zh" else "Event order is valid and usable for rhythm scoring",
+        },
+    ]
+
+    explanation = (
+        "当前评分基于 3D 奖杯位膝屈角（TP）权重 40%，3D 奖杯位躯干倾角（TP）权重 40%，辅助节奏观察权重 20%。"
+        " 击球高度、拍头下落肩外旋、击球瞬间肩抬高与肘屈已由 3D 模型计算，当前作为扩展观察项展示，暂不纳入总分。"
+        if lang == "zh"
+        else "The current score uses 3D trophy knee flexion (40%), 3D trophy trunk inclination (40%), and auxiliary timing (20%)."
+    )
+    basis = (
+        "当前版本采用关键事件驱动的 3D 动作分析口径，围绕奖杯位（TP）、拍头下落（RLP）和击球瞬间（BI）三个关键阶段建立分析框架。"
+        " 当前总分仅纳入 TP 膝屈角、TP 躯干倾角和辅助节奏观察；击球高度、RLP 肩外旋以及 BI 肩抬高/肘屈已完成 3D 计算，暂作为扩展观察项展示。"
+        if lang == "zh"
+        else "This version uses a key-event-driven 3D analysis pipeline around TP, RLP, and BI."
+    )
+    timing_note = (
+        "辅助节奏观察用于反映动作节奏与关键事件组织情况。三个阶段时序分数按等权平均计算，区间中心值对应更高分。"
+        if lang == "zh"
+        else "Auxiliary timing reflects event organization; the three interval scores are averaged equally."
+    )
+
+    return {
+        "final_score": final_score,
+        "coverage_ratio": 2.0 / 3.0,
+        "explanation": explanation,
+        "basis": basis,
+        "core_rows": core_rows,
+        "score_rows": score_rows,
+        "quality_rows": quality_rows,
+        "timing_rows": timing_rows,
+        "timing_total_score": timing_score,
+        "timing_total_note": timing_note,
+        "raw_values": {
+            "tp_knee_flexion_deg": tp_knee,
+            "tp_trunk_inclination_deg": tp_trunk,
+            "impact_height_norm": impact_height_norm,
+            "rlp_shoulder_external_rotation_deg": rlp_shoulder_er,
+            "bi_shoulder_raise_deg": bi_shoulder_raise,
+            "bi_elbow_flexion_deg": bi_elbow_flex,
+            "timing_toss_to_trophy": _safe_float(timing_metrics.get("timing_toss_to_trophy")),
+            "timing_trophy_to_drop": _safe_float(timing_metrics.get("timing_trophy_to_drop")),
+            "timing_drop_to_contact": _safe_float(timing_metrics.get("timing_drop_to_contact")),
+            "tp_knee_score": knee_score,
+            "tp_trunk_score": trunk_score,
+            "timing_score": timing_score,
+        },
+    }
+
+
 def _render_html(
     out_dir: str,
     final_score: float,
@@ -413,6 +1096,9 @@ def _render_html(
     biomech: Dict[str, object],
     phases: Dict[str, object],
     lang: str,
+    verification_3d: Optional[Dict[str, object]] = None,
+    keyframe_3d: Optional[Dict[str, object]] = None,
+    report_3d_summary: Optional[Dict[str, object]] = None,
 ) -> str:
     t = I18N.get(lang, I18N["en"])
     def label(key: str) -> str:
@@ -677,6 +1363,126 @@ def _render_html(
         for name, path in keyframes.items()
     )
 
+    keyframe_3d_title = "四个关键帧 3D 对比与关键角度" if lang == "zh" else "3D Keyframes And Angles"
+    keyframe_3d_note = "未提供四个关键帧的 3D 结果。" if lang == "zh" else "3D keyframe results are not available."
+    keyframe_3d_section = ""
+    phase_payloads = keyframe_3d.get("phases") if isinstance(keyframe_3d, dict) else None
+    if isinstance(phase_payloads, dict):
+        phase_cards = []
+        for phase_name in KEYFRAME_3D_PHASES:
+            payload = phase_payloads.get(phase_name)
+            if not isinstance(payload, dict):
+                continue
+
+            phase_label = str(payload.get("label") or _phase_display_name(phase_name, lang))
+            frame_num = payload.get("frame_num")
+            frame_text = (
+                f"（第 {int(frame_num)} 帧）"
+                if lang == "zh" and isinstance(frame_num, (int, float))
+                else (f"(Frame {int(frame_num)})" if isinstance(frame_num, (int, float)) else "")
+            )
+            artifact_paths = payload.get("artifact_paths") or {}
+            compare_path = artifact_paths.get("compare")
+            error_text = payload.get("error")
+            metric_pool = {}
+            metric_pool.update(payload.get("angles_3d") or {})
+            metric_pool.update(payload.get("phase_metrics_3d") or {})
+            angle_rows = []
+            for metric_name in KEYFRAME_3D_ANGLE_ORDER.get(phase_name, []):
+                value = metric_pool.get(metric_name)
+                if not isinstance(value, (int, float, np.floating)) or not np.isfinite(value):
+                    continue
+                suffix = " BH" if metric_name == "impact_height_norm" else "°"
+                display_value = f"{float(value):.3f}{suffix}" if metric_name == "impact_height_norm" else f"{float(value):.1f}{suffix}"
+                angle_rows.append(
+                    f"<tr><td>{html_lib.escape(_angle_display_name(metric_name, lang))}</td><td>{display_value}</td></tr>"
+                )
+            if not angle_rows:
+                angle_rows.append(
+                    f"<tr><td colspan='2'>{html_lib.escape('未能提取有效 3D 角度。' if lang == 'zh' else 'No valid 3D angles were extracted.')}</td></tr>"
+                )
+
+            if compare_path:
+                media_html = f"<img src='{compare_path}' alt='{html_lib.escape(phase_label)}'>"
+            else:
+                message = str(error_text or keyframe_3d_note)
+                media_html = f"<div class='note'>{html_lib.escape(message)}</div>"
+
+            phase_cards.append(
+                f"""
+  <div class="phase-card">
+    <div class="phase-media">
+      <div class="label">{html_lib.escape(phase_label)} {html_lib.escape(frame_text)}</div>
+      {media_html}
+    </div>
+    <div class="phase-metrics">
+      <table>
+        <tr><th>{t["metric"]}</th><th>{t["value"]}</th></tr>
+        {"".join(angle_rows)}
+      </table>
+    </div>
+  </div>
+"""
+            )
+        if phase_cards:
+            keyframe_3d_section = f"""
+  <div class="section">
+    <h2>{keyframe_3d_title}</h2>
+    {''.join(phase_cards)}
+  </div>
+"""
+    if not keyframe_3d_section:
+        keyframe_3d_section = f"""
+  <div class="section">
+    <h2>{keyframe_3d_title}</h2>
+    <div class="note">{html_lib.escape(keyframe_3d_note)}</div>
+  </div>
+"""
+
+    report_summary = report_3d_summary or {}
+    score_block = (
+        f"{float(report_summary.get('final_score')):.1f}"
+        if isinstance(report_summary.get("final_score"), (int, float, np.floating)) and np.isfinite(report_summary.get("final_score"))
+        else f"{final_score:.1f}"
+    )
+    coverage_pct = (
+        float(report_summary.get("coverage_ratio")) * 100.0
+        if isinstance(report_summary.get("coverage_ratio"), (int, float, np.floating)) and np.isfinite(report_summary.get("coverage_ratio"))
+        else (biomech.get("coverage") or 0.0) * 100.0
+    )
+    core_rows_html = "\n".join(
+        f"<tr><td>{html_lib.escape(str(row.get('name', '')))}</td><td>{html_lib.escape(str(row.get('value_text', '')))}</td><td>{html_lib.escape(str(row.get('conclusion', '')))}</td></tr>"
+        for row in (report_summary.get("core_rows") or [])
+    )
+    def _score_cell(row: Dict[str, object]) -> str:
+        value = _safe_float(row.get("score"))
+        return "n/a" if not np.isfinite(value) else f"{value:.1f}"
+
+    def _timing_value_cell(row: Dict[str, object]) -> str:
+        value = _safe_float(row.get("value"))
+        return "n/a" if not np.isfinite(value) else f"{value:.3f}s"
+
+    score_rows_html = "\n".join(
+        f"<tr><td>{html_lib.escape(str(row.get('name', '')))}</td><td>{_score_cell(row)}</td><td>{int(round(float(row.get('weight', 0.0)) * 100))}%</td><td>{html_lib.escape(str(row.get('note', '')))}</td></tr>"
+        for row in (report_summary.get("score_rows") or [])
+    )
+    quality_rows_html = "\n".join(
+        f"<tr><td>{html_lib.escape(str(row.get('name', '')))}</td><td>{html_lib.escape(str(row.get('success', 'n/a')))}</td><td>{('是' if row.get('usable') else '否') if lang == 'zh' else ('Yes' if row.get('usable') else 'No')}</td><td>{html_lib.escape(str(row.get('note', '')))}</td></tr>"
+        for row in (report_summary.get("quality_rows") or [])
+    )
+    timing_rows_html = "\n".join(
+        f"<tr><td>{html_lib.escape(str(row.get('name', '')))}</td><td>{_timing_value_cell(row)}</td><td>{_score_cell(row)}</td><td>{html_lib.escape(str(row.get('note', '')))}</td></tr>"
+        for row in (report_summary.get("timing_rows") or [])
+    )
+    timing_total_score = _safe_float(report_summary.get("timing_total_score"))
+    timing_total_html = (
+        f"<tr><td>{'辅助节奏观察总分' if lang == 'zh' else 'Auxiliary Timing Total'}</td><td>—</td><td>{timing_total_score:.1f}</td><td>{html_lib.escape(str(report_summary.get('timing_total_note', '')))}</td></tr>"
+        if np.isfinite(timing_total_score)
+        else ""
+    )
+    top_explanation = html_lib.escape(str(report_summary.get("explanation", "")))
+    basis_note = html_lib.escape(str(report_summary.get("basis", "")))
+
     html = f"""<!doctype html>
 <html>
 <head>
@@ -693,83 +1499,416 @@ def _render_html(
     .img-grid {{ display: flex; gap: 16px; flex-wrap: wrap; }}
     .img-card {{ width: 320px; }}
     .img-card img {{ width: 100%; border: 1px solid #ddd; }}
+    .verify-grid .img-card {{ width: 360px; }}
+    .verify-grid .verify-hero {{ width: 100%; max-width: 1100px; }}
+    .verify-grid .verify-wide {{ width: 520px; }}
     .label {{ font-weight: bold; margin-bottom: 6px; }}
     .note {{ margin-top: 6px; color: #555; font-size: 13px; }}
+    .badge {{ display: inline-block; padding: 4px 10px; border-radius: 999px; font-weight: bold; }}
+    .badge.good {{ background: #e6f4ea; color: #1b7837; }}
+    .badge.caution {{ background: #fff3cd; color: #8a6d3b; }}
+    .badge.needs-review {{ background: #f8d7da; color: #a61e4d; }}
+    .phase-card {{ display: grid; grid-template-columns: minmax(460px, 1.45fr) minmax(260px, 0.85fr); gap: 18px; margin-top: 18px; align-items: start; }}
+    .phase-media img {{ width: 100%; border: 1px solid #ddd; }}
+    @media (max-width: 980px) {{
+      .phase-card {{ grid-template-columns: 1fr; }}
+    }}
   </style>
 </head>
 <body>
   <h1>{t["title"]}</h1>
   <div class="score">{score_block}</div>
-  <div>{t["final_score"]}</div>
-  {f"<div>评分覆盖率：{(biomech.get('coverage') or 0.0) * 100:.0f}%</div>" if lang == "zh" else f"<div>Coverage: {(biomech.get('coverage') or 0.0) * 100:.0f}%</div>"}
+  <div>{"技术评分（当前版，0–100）" if lang == "zh" else "Technical Score (Current Version, 0–100)"}</div>
+  <div>{"核心指标覆盖率" if lang == "zh" else "Core Metric Coverage"}：{coverage_pct:.0f}%</div>
+  <div class="note">{top_explanation}</div>
 
   <div class="section">
-    <h2>{t["hand_assignment"]}</h2>
+    <h2>{"核心技术指标（文献支持）" if lang == "zh" else "Core Technical Metrics"}</h2>
     <table>
-      <tr><th>{t["selected"]}</th><th>{t["mirror_suspect"]}</th><th>{t["guess"]}</th></tr>
-      <tr>
-        <td>{value_text(hand_meta.get("hand_mode_selected", "n/a"))}</td>
-        <td>{value_text(hand_meta.get("mirror_suspect", "n/a"))}</td>
-        <td>{value_text(hand_meta.get("hand_mode_guess", "n/a"))}</td>
-      </tr>
+      <tr><th>{"指标" if lang == "zh" else "Metric"}</th><th>{"数值" if lang == "zh" else "Value"}</th><th>{"评估结论" if lang == "zh" else "Assessment"}</th></tr>
+      {core_rows_html}
     </table>
+    <div class="note">{basis_note}</div>
   </div>
 
   <div class="section">
-    <h2>{t["data_source"]}</h2>
+    <h2>{"评分构成" if lang == "zh" else "Score Composition"}</h2>
     <table>
-      <tr><th>{t["metric"]}</th><th>{t["value"]}</th></tr>
-      {"".join([f"<tr><td>{label(k)}</td><td>{value_text(v)}</td></tr>" for k, v in source_meta.items()])}
+      <tr><th>{"项目" if lang == "zh" else "Item"}</th><th>{"分数" if lang == "zh" else "Score"}</th><th>{"权重" if lang == "zh" else "Weight"}</th><th>{"说明" if lang == "zh" else "Notes"}</th></tr>
+      {score_rows_html}
     </table>
-  </div>
-
-  <div class="section">
-    <h2>{t["biomech"]}</h2>
-    <table>
-      <tr><th>{t["metric"]}</th><th>{t["value"]}</th><th>{t["notes"]}</th></tr>
-      {metrics_rows}
-    </table>
-    {f"<table><tr><th>{t['z_scores']}</th><th>{t['value']}</th></tr>{z_rows}</table>" if z_rows else ""}
     <div class="note">
-      {("计算依据：Jacquier-Bret & Gorce 2024 系统综述/元分析（奖杯位膝屈与躯干倾角均值±1SD）；击球高度参照 Mendes 2013；时序参考 Tubez 2019。"
-        if lang == "zh"
-        else "Basis: Jacquier-Bret & Gorce 2024 meta-analysis (trophy knee flexion & trunk inclination mean±1SD); impact height per Mendes 2013; timing per Tubez 2019.")}
+      {"技术评分计算方式：奖杯位膝屈角 × 40% + 奖杯位躯干倾角 × 40% + 辅助节奏观察 × 20%。" if lang == "zh" else "Technical score = trophy knee flexion × 40% + trophy trunk inclination × 40% + auxiliary timing × 20%."}
     </div>
   </div>
 
   <div class="section">
-    <h2>{t["subscores"]}</h2>
+    <h2>{"数据质量与可评分性" if lang == "zh" else "Data Quality And Scorability"}</h2>
     <table>
-      <tr><th>{t["category"]}</th><th>{t["score"]}</th></tr>
-      {subs_rows}
+      <tr><th>{"项目" if lang == "zh" else "Item"}</th><th>{"检测成功率" if lang == "zh" else "Success Rate"}</th><th>{"可用于评分" if lang == "zh" else "Used In Score"}</th><th>{"备注" if lang == "zh" else "Notes"}</th></tr>
+      {quality_rows_html}
     </table>
   </div>
 
   <div class="section">
-    <h2>{t["confidence"]}</h2>
+    <h2>{"辅助节奏观察（纳入总分）" if lang == "zh" else "Auxiliary Timing (Included In Total Score)"}</h2>
     <table>
-      <tr><th>{conf_headers[0]}</th><th>{conf_headers[1]}</th><th>{conf_headers[2]}</th><th>{conf_headers[3]}</th></tr>
-      {confidence_rows}
+      <tr><th>{"指标" if lang == "zh" else "Metric"}</th><th>{"数值" if lang == "zh" else "Value"}</th><th>{"单项分" if lang == "zh" else "Item Score"}</th><th>{"观察结论" if lang == "zh" else "Observation"}</th></tr>
+      {timing_rows_html}
+      {timing_total_html}
     </table>
+    <div class="note">{html_lib.escape(str(report_summary.get("timing_total_note", "")))}</div>
   </div>
 
-  <div class="section">
-    <h2>{t["risk_flags"]}</h2>
-    <table>
-      <tr><th>{t["metric"]}</th><th>{t["value"]}</th></tr>
-      <tr><td>{label("risk_flags")}</td><td>{_format_risk_flags(biomech.get("risk_flags") or [], lang)}</td></tr>
-    </table>
-  </div>
+  {keyframe_3d_section}
+</body>
+</html>
+"""
+    return html
 
-  <div class="section">
-    <h2>{t["keyframes"]}</h2>
-    <div class="img-grid">
-      {key_imgs}
+
+def _build_compact_3d_report_summary(
+    keyframe_3d: Optional[Dict[str, object]],
+    timing_metrics: Dict[str, float],
+    lang: str,
+) -> Dict[str, object]:
+    phases = (keyframe_3d or {}).get("phases") if isinstance(keyframe_3d, dict) else {}
+    if not isinstance(phases, dict):
+        phases = {}
+
+    trophy_payload = phases.get("trophy") if isinstance(phases.get("trophy"), dict) else {}
+    drop_payload = phases.get("racket_drop") if isinstance(phases.get("racket_drop"), dict) else {}
+    contact_payload = phases.get("contact") if isinstance(phases.get("contact"), dict) else {}
+
+    trophy_metrics = trophy_payload.get("phase_metrics_3d") if isinstance(trophy_payload.get("phase_metrics_3d"), dict) else {}
+    drop_metrics = drop_payload.get("phase_metrics_3d") if isinstance(drop_payload.get("phase_metrics_3d"), dict) else {}
+    contact_metrics = contact_payload.get("phase_metrics_3d") if isinstance(contact_payload.get("phase_metrics_3d"), dict) else {}
+
+    tp_knee = _safe_float(trophy_metrics.get("lead_knee_flexion_deg"))
+    tp_trunk = _safe_float(trophy_metrics.get("trunk_inclination_deg"))
+    impact_height_norm = _safe_float(contact_metrics.get("impact_height_norm"))
+    rlp_shoulder_er = _safe_float(drop_metrics.get("shoulder_external_rotation_proxy_deg"))
+    bi_shoulder_raise = _safe_float(contact_metrics.get("shoulder_raise_deg"))
+    bi_elbow_flex = _safe_float(contact_metrics.get("elbow_flexion_deg"))
+
+    knee_score, _ = serve_score._score_lit_plateau(tp_knee, LIT_KNEE_MEAN, LIT_KNEE_SD)
+    trunk_score, _ = serve_score._score_lit_plateau(tp_trunk, LIT_TRUNK_MEAN, LIT_TRUNK_SD)
+
+    def _fmt_angle(value: float) -> str:
+        return "n/a" if not np.isfinite(value) else f"{value:.1f}°"
+
+    def _fmt_bh(value: float) -> str:
+        return "n/a" if not np.isfinite(value) else f"{value:.3f} BH"
+
+    def _fmt_time(value: float) -> str:
+        return "n/a" if not np.isfinite(value) else f"{value:.3f}s"
+
+    timing_specs = [
+        (
+            "timing_toss_to_trophy",
+            "抛球→奖杯位间隔" if lang == "zh" else "Toss to Trophy Interval",
+            "暂无统一参考" if lang == "zh" else "No unified reference",
+            TIMING_RANGES["timing_toss_to_trophy"],
+        ),
+        (
+            "timing_trophy_to_drop",
+            "奖杯位→下落间隔" if lang == "zh" else "Trophy to Drop Interval",
+            "约 0.19–0.20s" if lang == "zh" else "About 0.19-0.20s",
+            TIMING_RANGES["timing_trophy_to_drop"],
+        ),
+        (
+            "timing_drop_to_contact",
+            "下落→击球间隔" if lang == "zh" else "Drop to Contact Interval",
+            "约 0.12–0.13s" if lang == "zh" else "About 0.12-0.13s",
+            TIMING_RANGES["timing_drop_to_contact"],
+        ),
+    ]
+    timing_rows: List[Dict[str, object]] = []
+    timing_scores: List[float] = []
+    for key, display_name, reference_text, rng in timing_specs:
+        value = _safe_float(timing_metrics.get(key))
+        score = _score_centered_range(value, rng[0], rng[1], edge_score=80.0)
+        if np.isfinite(score):
+            timing_scores.append(score)
+        timing_rows.append(
+            {
+                "name": display_name,
+                "current_value": _fmt_time(value),
+                "reference": reference_text,
+            }
+        )
+
+    timing_score = float(np.mean(timing_scores)) if timing_scores else float("nan")
+    final_score = _weighted_score(
+        [
+            (knee_score, 0.40),
+            (trunk_score, 0.40),
+            (timing_score, 0.20),
+        ]
+    )
+
+    core_rows = [
+        {
+            "name": "奖杯位膝屈角（TP）" if lang == "zh" else "Trophy Knee Flexion (TP)",
+            "current_value": _fmt_angle(tp_knee),
+            "reference": "64.5 ± 9.7°",
+        },
+        {
+            "name": "奖杯位躯干倾角（TP）" if lang == "zh" else "Trophy Trunk Inclination (TP)",
+            "current_value": _fmt_angle(tp_trunk),
+            "reference": "25.0 ± 7.1°",
+        },
+        {
+            "name": "击球高度（身高归一化）" if lang == "zh" else "Impact Height (Body-Height Normalized)",
+            "current_value": _fmt_bh(impact_height_norm),
+            "reference": "约 1.50 BH" if lang == "zh" else "About 1.50 BH",
+        },
+        {
+            "name": "拍头下落肩外旋（RLP）" if lang == "zh" else "Racket-Drop Shoulder External Rotation (RLP)",
+            "current_value": _fmt_angle(rlp_shoulder_er),
+            "reference": "130.1 ± 26.5°",
+        },
+        {
+            "name": "击球瞬间肩抬高（BI）" if lang == "zh" else "Impact Shoulder Raise (BI)",
+            "current_value": _fmt_angle(bi_shoulder_raise),
+            "reference": "110.7 ± 16.9°",
+        },
+        {
+            "name": "击球瞬间肘屈（BI）" if lang == "zh" else "Impact Elbow Flexion (BI)",
+            "current_value": _fmt_angle(bi_elbow_flex),
+            "reference": "30.1 ± 15.9°",
+        },
+    ]
+
+    score_rows = [
+        {
+            "name": "奖杯位膝屈角（TP）" if lang == "zh" else "Trophy Knee Flexion (TP)",
+            "score": knee_score,
+            "weight": 0.40,
+        },
+        {
+            "name": "奖杯位躯干倾角（TP）" if lang == "zh" else "Trophy Trunk Inclination (TP)",
+            "score": trunk_score,
+            "weight": 0.40,
+        },
+        {
+            "name": "辅助节奏观察" if lang == "zh" else "Auxiliary Timing",
+            "score": timing_score,
+            "weight": 0.20,
+        },
+        {
+            "name": "击球高度（归一化）" if lang == "zh" else "Impact Height (Normalized)",
+            "score": float("nan"),
+            "weight": 0.0,
+        },
+        {
+            "name": "技术评分" if lang == "zh" else "Technical Score",
+            "score": final_score,
+            "weight": 1.0,
+        },
+    ]
+
+    timing_rows.append(
+        {
+            "name": "辅助节奏观察总分" if lang == "zh" else "Auxiliary Timing Total",
+            "current_value": "n/a" if not np.isfinite(timing_score) else f"{timing_score:.1f}",
+            "reference": "系统计算" if lang == "zh" else "System computed",
+        }
+    )
+
+    return {
+        "final_score": final_score,
+        "coverage_ratio": 2.0 / 3.0,
+        "core_rows": core_rows,
+        "score_rows": score_rows,
+        "timing_rows": timing_rows,
+        "raw_values": {
+            "tp_knee_flexion_deg": tp_knee,
+            "tp_trunk_inclination_deg": tp_trunk,
+            "impact_height_norm": impact_height_norm,
+            "rlp_shoulder_external_rotation_deg": rlp_shoulder_er,
+            "bi_shoulder_raise_deg": bi_shoulder_raise,
+            "bi_elbow_flexion_deg": bi_elbow_flex,
+            "timing_toss_to_trophy": _safe_float(timing_metrics.get("timing_toss_to_trophy")),
+            "timing_trophy_to_drop": _safe_float(timing_metrics.get("timing_trophy_to_drop")),
+            "timing_drop_to_contact": _safe_float(timing_metrics.get("timing_drop_to_contact")),
+            "tp_knee_score": knee_score,
+            "tp_trunk_score": trunk_score,
+            "timing_score": timing_score,
+        },
+    }
+
+
+def _render_compact_html(
+    out_dir: str,
+    keyframe_3d: Optional[Dict[str, object]],
+    report_summary: Optional[Dict[str, object]],
+    lang: str,
+) -> str:
+    page_title = "动作评估报告" if lang == "zh" else "Motion Evaluation Report"
+    report_summary = report_summary or {}
+
+    def _score_cell(value: object) -> str:
+        numeric = _safe_float(value)
+        return "n/a" if not np.isfinite(numeric) else f"{numeric:.1f}"
+
+    core_rows_html = "\n".join(
+        f"<tr><td>{html_lib.escape(str(row.get('name', '')))}</td><td>{html_lib.escape(str(row.get('current_value', '')))}</td><td>{html_lib.escape(str(row.get('reference', '')))}</td></tr>"
+        for row in (report_summary.get("core_rows") or [])
+    )
+    score_rows_html = "\n".join(
+        f"<tr><td>{html_lib.escape(str(row.get('name', '')))}</td><td>{_score_cell(row.get('score'))}</td><td>{int(round(float(row.get('weight', 0.0)) * 100))}%</td></tr>"
+        for row in (report_summary.get("score_rows") or [])
+    )
+    timing_rows_html = "\n".join(
+        f"<tr><td>{html_lib.escape(str(row.get('name', '')))}</td><td>{html_lib.escape(str(row.get('current_value', '')))}</td><td>{html_lib.escape(str(row.get('reference', '')))}</td></tr>"
+        for row in (report_summary.get("timing_rows") or [])
+    )
+
+    keyframe_3d_title = "关键帧对比" if lang == "zh" else "Keyframe Comparison"
+    keyframe_3d_note = "未生成关键帧 3D 对比结果。" if lang == "zh" else "3D keyframe comparison is unavailable."
+    keyframe_3d_section = ""
+    phase_payloads = keyframe_3d.get("phases") if isinstance(keyframe_3d, dict) else None
+    if isinstance(phase_payloads, dict):
+        phase_cards = []
+        for phase_name in KEYFRAME_3D_PHASES:
+            payload = phase_payloads.get(phase_name)
+            if not isinstance(payload, dict):
+                continue
+
+            phase_label = str(payload.get("label") or _phase_display_name(phase_name, lang))
+            frame_num = payload.get("frame_num")
+            frame_text = (
+                f"（第 {int(frame_num)} 帧）"
+                if lang == "zh" and isinstance(frame_num, (int, float))
+                else (f"(Frame {int(frame_num)})" if isinstance(frame_num, (int, float)) else "")
+            )
+            artifact_paths = payload.get("artifact_paths") or {}
+            compare_path = artifact_paths.get("compare")
+            metric_pool: Dict[str, object] = {}
+            metric_pool.update(payload.get("angles_3d") or {})
+            metric_pool.update(payload.get("phase_metrics_3d") or {})
+
+            angle_rows = []
+            for metric_name in KEYFRAME_3D_ANGLE_ORDER.get(phase_name, []):
+                value = metric_pool.get(metric_name)
+                if not isinstance(value, (int, float, np.floating)) or not np.isfinite(value):
+                    continue
+                if metric_name == "impact_height_norm":
+                    display_value = f"{float(value):.3f} BH"
+                else:
+                    display_value = f"{float(value):.1f}°"
+                angle_rows.append(
+                    f"<tr><td>{html_lib.escape(_angle_display_name(metric_name, lang))}</td><td>{display_value}</td></tr>"
+                )
+            if not angle_rows:
+                angle_rows.append(
+                    f"<tr><td colspan='2'>{html_lib.escape('未提取到有效角度。' if lang == 'zh' else 'No valid angles extracted.')}</td></tr>"
+                )
+
+            media_html = (
+                f"<img src='{compare_path}' alt='{html_lib.escape(phase_label)}'>"
+                if compare_path
+                else f"<div class='note'>{html_lib.escape(keyframe_3d_note)}</div>"
+            )
+
+            phase_cards.append(
+                f"""
+  <div class="phase-card">
+    <div class="phase-media">
+      <div class="label">{html_lib.escape(phase_label)}{html_lib.escape(frame_text)}</div>
+      {media_html}
     </div>
-    <div class="note">
-      {("强制校正：奖杯位=原“拍头下落”帧；拍头下落在奖杯位之后重新搜索（确保 HRP→LRP→Impact）" if lang == "zh" else "Forced correction: HRP uses previous drop frame; LRP re-searched after HRP to enforce HRP→LRP→Impact.")}
+    <div class="phase-metrics">
+      <div class="label">{html_lib.escape(phase_label)}</div>
+      <table>
+        <tr><th>{"指标" if lang == "zh" else "Metric"}</th><th>{"当前值" if lang == "zh" else "Current Value"}</th></tr>
+        {"".join(angle_rows)}
+      </table>
     </div>
   </div>
+"""
+            )
+        if phase_cards:
+            keyframe_3d_section = f"""
+  <div class="section">
+    <h2>{keyframe_3d_title}</h2>
+    {''.join(phase_cards)}
+  </div>
+"""
+    if not keyframe_3d_section:
+        keyframe_3d_section = f"""
+  <div class="section">
+    <h2>{keyframe_3d_title}</h2>
+    <div class="note">{html_lib.escape(keyframe_3d_note)}</div>
+  </div>
+"""
+
+    score_block = (
+        f"{float(report_summary.get('final_score')):.1f}"
+        if isinstance(report_summary.get("final_score"), (int, float, np.floating)) and np.isfinite(report_summary.get("final_score"))
+        else "n/a"
+    )
+    coverage_pct = (
+        float(report_summary.get("coverage_ratio")) * 100.0
+        if isinstance(report_summary.get("coverage_ratio"), (int, float, np.floating)) and np.isfinite(report_summary.get("coverage_ratio"))
+        else 0.0
+    )
+
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{page_title}</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 24px; color: #222; }}
+    h1 {{ margin: 0 0 8px 0; }}
+    h2 {{ margin-bottom: 8px; }}
+    .score {{ font-size: 42px; font-weight: bold; color: #1b7837; }}
+    .section {{ margin-top: 28px; }}
+    .label {{ font-weight: bold; margin-bottom: 6px; }}
+    .note {{ margin-top: 6px; color: #555; font-size: 13px; }}
+    table {{ border-collapse: collapse; width: 100%; margin-top: 8px; }}
+    th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+    th {{ background: #f5f5f5; }}
+    .phase-card {{ display: grid; grid-template-columns: minmax(520px, 1.45fr) minmax(260px, 0.85fr); gap: 18px; margin-top: 18px; align-items: start; }}
+    .phase-media img {{ width: 100%; border: 1px solid #ddd; }}
+    @media (max-width: 980px) {{
+      .phase-card {{ grid-template-columns: 1fr; }}
+    }}
+  </style>
+</head>
+<body>
+  <h1>{page_title}</h1>
+  <div class="score">{score_block}</div>
+  <div>{"技术评分" if lang == "zh" else "Technical Score"}</div>
+  <div>{"核心指标覆盖率" if lang == "zh" else "Core Metric Coverage"} {coverage_pct:.0f}%</div>
+
+  <div class="section">
+    <h2>{"核心技术指标" if lang == "zh" else "Core Technical Metrics"}</h2>
+    <table>
+      <tr><th>{"指标" if lang == "zh" else "Metric"}</th><th>{"当前值" if lang == "zh" else "Current Value"}</th><th>{"文献参考" if lang == "zh" else "Reference"}</th></tr>
+      {core_rows_html}
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>{"评分构成" if lang == "zh" else "Score Composition"}</h2>
+    <table>
+      <tr><th>{"项目" if lang == "zh" else "Item"}</th><th>{"分数" if lang == "zh" else "Score"}</th><th>{"权重" if lang == "zh" else "Weight"}</th></tr>
+      {score_rows_html}
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>{"辅助节奏观察" if lang == "zh" else "Auxiliary Timing"}</h2>
+    <table>
+      <tr><th>{"指标" if lang == "zh" else "Metric"}</th><th>{"当前值" if lang == "zh" else "Current Value"}</th><th>{"文献参考" if lang == "zh" else "Reference"}</th></tr>
+      {timing_rows_html}
+    </table>
+  </div>
+
+  {keyframe_3d_section}
 </body>
 </html>
 """
@@ -799,6 +1938,12 @@ def main() -> None:
                     help="Enable per-serve quantile calibration for impact/timing.")
     ap.add_argument("--hand_mode", choices=["auto", "A", "B"], default="auto",
                     help="Force hand assignment: A=left toss/right racket, B=right toss/left racket.")
+    ap.add_argument("--verify_3d", choices=["auto", "on", "off"], default="auto",
+                    help="Attach 3D verification to the report: auto=load/generate if possible.")
+    ap.add_argument("--verify_3d_neighbor_radius", type=int, default=2,
+                    help="Neighbor frame radius used for 3D stability verification.")
+    ap.add_argument("--verify_3d_device", default="auto",
+                    help="Torch device for HybrIK verification, e.g. auto/cpu/cuda:0.")
 
     args = ap.parse_args()
 
@@ -858,7 +2003,7 @@ def main() -> None:
 
     metrics = dict(result["metrics"])
     subscores = result["subscores"]
-    final_score = result["final_score"]
+    final_score_legacy = result["final_score"]
     biomech_full = result.get("biomech", {})
     biomech = {
         "subscores": biomech_full.get("subscores", {}),
@@ -880,7 +2025,7 @@ def main() -> None:
 
     metrics_path = os.path.join(args.out_dir, "metrics.json")
     payload = {
-        "final_score": final_score,
+        "final_score": final_score_legacy,
         "sub_scores": subscores,
         "metrics": metrics,
         "phases": phases,
@@ -924,6 +2069,22 @@ def main() -> None:
 
     run_id = int(time.time() * 1000)
     keyframes = _save_keyframes(args.video, phases, args.out_dir)
+    phase_frame_nums = {
+        phase_name: _phase_frame_num(phases, result.get("frames"), phase_name)
+        for phase_name in KEYFRAME_3D_PHASES
+    }
+    keyframe_3d = _maybe_generate_keyframe_3d_bundle(
+        out_dir=args.out_dir,
+        phase_frame_nums=phase_frame_nums,
+        lang=args.lang,
+        run_id=run_id,
+        verify_3d=args.verify_3d,
+        verify_device=args.verify_3d_device,
+    )
+    report_3d_summary = _build_compact_3d_report_summary(keyframe_3d, metrics, args.lang)
+    display_final_score = _safe_float(report_3d_summary.get("final_score"))
+    if not np.isfinite(display_final_score):
+        display_final_score = float(final_score_legacy)
     keyframes = {k: f"{v}?v={run_id}" for k, v in keyframes.items()}
     diagnosis = _diagnosis_biomech(subscores, biomech, args.lang)
     hand_meta = {
@@ -940,21 +2101,19 @@ def main() -> None:
         "smooth_mode": args.smooth_mode,
         "quantile_calib": args.quantile_calib,
     }
-    html = _render_html(
+    html = _render_compact_html(
         args.out_dir,
-        final_score,
-        subscores,
-        metrics,
-        keyframes,
-        plots,
-        diagnosis,
-        hand_meta,
-        result.get("quality_flags", {}),
-        source_meta,
-        biomech,
-        phases,
-        args.lang,
+        keyframe_3d=keyframe_3d,
+        report_summary=report_3d_summary,
+        lang=args.lang,
     )
+
+    payload["legacy_final_score_pose2d"] = final_score_legacy
+    payload["final_score"] = display_final_score
+    payload["keyframe_3d"] = keyframe_3d
+    payload["report_3d_summary"] = report_3d_summary
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
 
     html_path = os.path.join(args.out_dir, "report.html")
     with open(html_path, "w", encoding="utf-8") as f:

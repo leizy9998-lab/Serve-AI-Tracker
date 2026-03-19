@@ -22,3 +22,12 @@ output/
 # 4. 忽略 Python 和系统缓存
 __pycache__/
 .DS_Store
+.vscode/
+
+# 5. 忽略本地 third_party 大文件和模型资源
+third_party/HybrIK_resources.zip
+third_party/HybrIK-main.zip
+third_party/HybrIK-main/model_files/
+third_party/HybrIK-main/pretrained_models/
+third_party/HybrIK-main/assets/
+third_party/HybrIK-main/examples/
