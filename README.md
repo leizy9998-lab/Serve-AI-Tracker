@@ -1,24 +1,28 @@
 ---
 title: Serve AI Tracker
+emoji: 🎾
+colorFrom: blue
+colorTo: green
 sdk: gradio
-sdk_version: 4.x.x
+sdk_version: 4.44.1
 app_file: app.py
+pinned: false
 python_version: "3.10"
 ---
 
 # Serve AI Tracker
 
-ModelScope 创空间精简运行版，仅保留在线演示所需文件：
+ModelScope 创空间运行版。
+
+功能：
+
+- 上传网球发球视频
+- 自动提取人体关键点
+- 计算发球评分与关键阶段
+- 返回骨架回放视频与文字分析结果
+
+运行文件：
 
 - `app.py`
 - `serve_score.py`
 - `requirements.txt`
-
-功能说明：
-
-- 上传一段网球发球视频
-- 用 MediaPipe 提取人体关键点
-- 调用 `serve_score.analyze_serve()` 输出发球评分与关键阶段
-- 返回带骨架回放的视频和文字评估结果
-
-如果需要完整的 3D 建模、关键帧报告、HybrIK 工作流和本地开发脚本，请使用主仓库开发分支。
