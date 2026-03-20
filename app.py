@@ -23,6 +23,7 @@ HYBRIK_CHECKPOINT = os.path.join(HYBRIK_ROOT, "pretrained_models", "hybrik_hrnet
 HYBRIK_CONFIG = os.path.join(HYBRIK_ROOT, "configs", "256x192_adam_lr1e-3-hrw48_cam_2x_w_pw3d_3dhp.yaml")
 PHASE_NAMES = ["trophy", "racket_drop", "contact", "finish"]
 THREE_D_MODULES = ["cv2", "numpy", "torch", "torchvision", "easydict", "yaml", "PIL"]
+SPACE_BUILD_TAG = "space-build-2026-03-20-3d-v2"
 
 
 def _ensure_dir(path: str) -> None:
@@ -52,6 +53,7 @@ def _runtime_note() -> str:
     three_d_ready, issues = _runtime_3d_status()
     lines = [
         "# Serve AI Tracker",
+        f"- Build tag: `{SPACE_BUILD_TAG}`",
         "Upload a serve clip to generate a scoring report. The report tab keeps the existing 2D scoring flow and adds the local 3D keyframe workflow when the runtime supports it.",
         "",
         f"- Report pipeline: {'ready' if report_ready else 'missing required local files'}",
