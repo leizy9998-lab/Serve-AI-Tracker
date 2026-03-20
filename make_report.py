@@ -470,7 +470,7 @@ def _phase_frame_num(phases: Dict[str, object], frames: Optional[np.ndarray], na
 def _python_supports_3d_runtime(python_exe: str) -> bool:
     if not python_exe or not os.path.exists(python_exe):
         return False
-    cmd = [python_exe, "-c", "import cv2, numpy, torch, torchvision, easydict"]
+    cmd = [python_exe, "-c", "import cv2, numpy, torch, torchvision, easydict, yaml, PIL"]
     try:
         completed = subprocess.run(
             cmd,

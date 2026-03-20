@@ -7,3 +7,5 @@ matplotlib
 torch
 torchvision
 easydict
+PyYAML
+Pillow

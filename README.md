@@ -29,7 +29,7 @@ python run_hybrik_image.py --image D:\Serve_Score\out\serve_report\keyframes\tro
 ## Runtime Notes
 
 - The 2D report flow requires `gradio`, `mediapipe`, `opencv-python-headless`, `numpy`, `pandas`, and `matplotlib`.
-- The 3D workflow also requires `torch`, `torchvision`, `easydict`, the local `third_party/HybrIK-main` checkout, and a checkpoint at `third_party/HybrIK-main/pretrained_models/hybrik_hrnet.pth`.
+- The 3D workflow also requires `torch`, `torchvision`, `easydict`, `PyYAML`, `Pillow`, the local `third_party/HybrIK-main` checkout, and a checkpoint at `third_party/HybrIK-main/pretrained_models/hybrik_hrnet.pth`.
 - PDF export stays optional. If no supported PDF dependency is installed, the pipeline skips `report.pdf` gracefully.
 
 ## Output Location

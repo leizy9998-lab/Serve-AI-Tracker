@@ -1,6 +1,8 @@
+import base64
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -20,7 +22,7 @@ HYBRIK_ROOT = os.path.join(APP_ROOT, "third_party", "HybrIK-main")
 HYBRIK_CHECKPOINT = os.path.join(HYBRIK_ROOT, "pretrained_models", "hybrik_hrnet.pth")
 HYBRIK_CONFIG = os.path.join(HYBRIK_ROOT, "configs", "256x192_adam_lr1e-3-hrw48_cam_2x_w_pw3d_3dhp.yaml")
 PHASE_NAMES = ["trophy", "racket_drop", "contact", "finish"]
-THREE_D_MODULES = ["cv2", "numpy", "torch", "torchvision", "easydict"]
+THREE_D_MODULES = ["cv2", "numpy", "torch", "torchvision", "easydict", "yaml", "PIL"]
 
 
 def _ensure_dir(path: str) -> None:
@@ -108,6 +110,29 @@ def _score_text(value: object) -> str:
     return "n/a"
 
 
+def _collect_3d_errors(payload: Dict[str, object]) -> List[str]:
+    keyframe_3d = payload.get("keyframe_3d") if isinstance(payload.get("keyframe_3d"), dict) else {}
+    phase_payloads = keyframe_3d.get("phases") if isinstance(keyframe_3d.get("phases"), dict) else {}
+    errors: List[str] = []
+    for phase in PHASE_NAMES:
+        phase_payload = phase_payloads.get(phase)
+        if not isinstance(phase_payload, dict):
+            continue
+        error = phase_payload.get("error")
+        if error:
+            errors.append(f"{phase}: {error}")
+    return errors
+
+
+def _collect_3d_log_lines(logs: str) -> List[str]:
+    matches = []
+    for raw_line in logs.splitlines():
+        line = raw_line.strip()
+        if "3D" in line or "HybrIK" in line or "servepose" in line:
+            matches.append(line)
+    return matches[-6:]
+
+
 def _phase_text(payload: Dict[str, object]) -> str:
     phases = payload.get("phases") if isinstance(payload.get("phases"), dict) else {}
     lines = []
@@ -127,7 +152,7 @@ def _subscore_text(payload: Dict[str, object]) -> str:
     return "\n".join(lines)
 
 
-def _build_report_summary(payload: Dict[str, object], run_dir: str) -> str:
+def _build_report_summary(payload: Dict[str, object], run_dir: str, logs: str) -> str:
     final_score = payload.get("final_score")
     legacy_score = payload.get("legacy_final_score_pose2d", payload.get("legacy_final_score"))
     report_summary = payload.get("report_3d_summary") if isinstance(payload.get("report_3d_summary"), dict) else {}
@@ -151,6 +176,13 @@ def _build_report_summary(payload: Dict[str, object], run_dir: str) -> str:
         lines.append(f"- 3D keyframes completed: {', '.join(successful_3d_phases)}")
     else:
         lines.append("- 3D keyframes completed: none")
+        errors = _collect_3d_errors(payload)
+        if errors:
+            lines.append(f"- 3D failure: {errors[0]}")
+        else:
+            log_lines = _collect_3d_log_lines(logs)
+            if log_lines:
+                lines.append(f"- 3D runtime note: {log_lines[-1]}")
 
     lines.extend(["", "### Sub-scores", _subscore_text(payload), "", "### Phase Frames", _phase_text(payload)])
     return "\n".join(lines)
@@ -193,6 +225,40 @@ def _report_video_path(run_dir: str, pose_source: str) -> Optional[str]:
     )
 
 
+def _guess_mime_type(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    return {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".svg": "image/svg+xml",
+    }.get(ext, "application/octet-stream")
+
+
+def _inline_report_html(run_dir: str) -> str:
+    html_path = os.path.join(run_dir, "report.html")
+    if not os.path.exists(html_path):
+        return "<div>report.html not found.</div>"
+
+    with open(html_path, "r", encoding="utf-8") as f:
+        html = f.read()
+
+    def _replace_src(match: re.Match[str]) -> str:
+        quote = match.group(1)
+        src = match.group(2)
+        if src.startswith(("http://", "https://", "data:")):
+            return match.group(0)
+        abs_path = os.path.abspath(os.path.join(run_dir, src.split("?", 1)[0]))
+        if not os.path.exists(abs_path):
+            return match.group(0)
+        with open(abs_path, "rb") as img_file:
+            encoded = base64.b64encode(img_file.read()).decode("ascii")
+        return f"src={quote}data:{_guess_mime_type(abs_path)};base64,{encoded}{quote}"
+
+    return re.sub(r"src=(['\"])([^'\"]+)\1", _replace_src, html)
+
+
 def run_serve_report(
     video_path: Optional[str],
     pose_csv_path: Optional[str],
@@ -202,7 +268,7 @@ def run_serve_report(
     quantile_calib: bool,
     verify_3d: str,
     verify_device: str,
-) -> Tuple[str, Optional[str], List[Tuple[str, str]], List[str], Dict[str, object], str]:
+) -> Tuple[str, str, Optional[str], List[Tuple[str, str]], List[str], Dict[str, object], str]:
     if not video_path:
         raise gr.Error("Upload a serve video first.")
     if not os.path.exists(MAKE_REPORT_SCRIPT):
@@ -243,11 +309,12 @@ def run_serve_report(
         raise gr.Error(f"Report finished but metrics.json is missing in {run_dir}")
 
     payload = _read_json(metrics_path)
-    summary = _build_report_summary(payload, run_dir)
+    summary = _build_report_summary(payload, run_dir, logs)
+    html_preview = _inline_report_html(run_dir)
     annotated_video = _report_video_path(run_dir, pose_source)
     gallery = _collect_report_gallery(run_dir)
     downloads = _report_artifacts(run_dir, pose_source)
-    return summary, annotated_video, gallery, downloads, payload, logs
+    return summary, html_preview, annotated_video, gallery, downloads, payload, logs
 
 
 def _format_trophy_metrics(metrics: Dict[str, object], debug: Dict[str, object]) -> str:
@@ -350,7 +417,7 @@ with gr.Blocks(title="Serve AI Tracker") as demo:
             quantile_input = gr.Checkbox(value=False, label="Enable quantile calibration")
             verify_3d_input = gr.Dropdown(
                 choices=["auto", "on", "off"],
-                value="auto",
+                value="on",
                 label="3D keyframe analysis",
             )
             verify_device_input = gr.Dropdown(
@@ -362,6 +429,7 @@ with gr.Blocks(title="Serve AI Tracker") as demo:
         report_button = gr.Button("Generate report", variant="primary")
 
         report_summary = gr.Markdown(label="Summary")
+        report_html = gr.HTML(label="Report Preview")
         report_video = gr.Video(label="Annotated pose video")
         report_gallery = gr.Gallery(label="Keyframes and 3D overlays", height=420)
         report_downloads = gr.File(label="Download artifacts", file_count="multiple")
@@ -382,6 +450,7 @@ with gr.Blocks(title="Serve AI Tracker") as demo:
             ],
             outputs=[
                 report_summary,
+                report_html,
                 report_video,
                 report_gallery,
                 report_downloads,
