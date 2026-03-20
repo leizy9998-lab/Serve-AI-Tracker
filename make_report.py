@@ -467,19 +467,54 @@ def _phase_frame_num(phases: Dict[str, object], frames: Optional[np.ndarray], na
     return idx
 
 
+def _python_supports_3d_runtime(python_exe: str) -> bool:
+    if not python_exe or not os.path.exists(python_exe):
+        return False
+    cmd = [python_exe, "-c", "import cv2, numpy, torch, torchvision, easydict"]
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return False
+    return completed.returncode == 0
+
+
 def _find_servepose_python() -> Optional[str]:
     exe = os.path.abspath(sys.executable)
-    exe_dir = os.path.dirname(exe)
-    if os.path.basename(exe_dir).lower() == "servepose":
+    if _python_supports_3d_runtime(exe):
         return exe
 
-    roots = {exe_dir}
-    if os.path.basename(os.path.dirname(exe_dir)).lower() == "envs":
-        roots.add(os.path.dirname(os.path.dirname(exe_dir)))
+    exe_dir = os.path.dirname(exe)
+    roots = {exe_dir, os.path.dirname(exe_dir), os.path.dirname(os.path.dirname(exe_dir))}
 
+    conda_exe = os.environ.get("CONDA_EXE")
+    if conda_exe:
+        conda_root = os.path.dirname(os.path.dirname(os.path.abspath(conda_exe)))
+        roots.add(conda_root)
+
+    candidates = []
     for root in roots:
-        candidate = os.path.join(root, "envs", "servepose", "python.exe")
-        if os.path.exists(candidate):
+        candidates.extend(
+            [
+                os.path.join(root, "envs", "servepose", "python.exe"),
+                os.path.join(root, "envs", "servepose", "bin", "python"),
+            ]
+        )
+
+    seen = set()
+    for candidate in candidates:
+        candidate = os.path.abspath(candidate)
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if _python_supports_3d_runtime(candidate):
             return candidate
     return None
 

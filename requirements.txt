@@ -1,5 +1,9 @@
-gradio
+gradio>=4,<5
 mediapipe==0.10.9
 opencv-python-headless
 numpy
 pandas
+matplotlib
+torch
+torchvision
+easydict
