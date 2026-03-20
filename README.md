@@ -36,3 +36,9 @@ python run_hybrik_image.py --image D:\Serve_Score\out\serve_report\keyframes\tro
 
 - Space runs: `out/space_runs/...`
 - Local CLI runs: any folder passed with `--out_dir`, typically under `D:\Serve_Score\out\...`
+
+## Runtime File Set
+
+- Core app: `app.py`, `make_report.py`, `serve_score.py`, `extract_pose_compare.py`, `run_hybrik_image.py`
+- Runtime assets: `models/pose_landmarker_full.task`, `third_party/HybrIK-main/model_files/*`, `third_party/HybrIK-main/pretrained_models/hybrik_hrnet.pth`
+- HybrIK runtime code: `third_party/HybrIK-main/hybrik/models`, `third_party/HybrIK-main/hybrik/utils`, and the single active config `third_party/HybrIK-main/configs/256x192_adam_lr1e-3-hrw48_cam_2x_w_pw3d_3dhp.yaml`
