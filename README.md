@@ -24,6 +24,16 @@ The repository is intentionally split this way because the 2D flow is cheap enou
 
 The demo above shows the current smooth-pose tracking overlay produced by the local report pipeline.
 
+## Example Keyframe Comparisons
+
+The images below are pulled from a previous local Roger Federer report. Each comparison shows the original keyframe together with the 3D mesh modeling result used in the compact report output.
+
+| Trophy phase | Contact phase |
+| --- | --- |
+| ![Roger Federer trophy keyframe comparison](./assets/case-studies/roger-trophy-compare.png) | ![Roger Federer contact keyframe comparison](./assets/case-studies/roger-contact-compare.png) |
+| Racket drop phase | Finish phase |
+| ![Roger Federer racket drop keyframe comparison](./assets/case-studies/roger-racket-drop-compare.png) | ![Roger Federer finish keyframe comparison](./assets/case-studies/roger-finish-compare.png) |
+
 ## Highlights
 
 - single-player serve tracking from broadcast-style tennis clips
