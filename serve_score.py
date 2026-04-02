@@ -166,6 +166,171 @@ def _infer_toss_side(left_wrist_y: np.ndarray, right_wrist_y: np.ndarray) -> Tup
     return "left", {"left": l["score"], "right": r["score"]}
 
 
+def _normalize_finite(values: np.ndarray, inverse: bool = False) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    out = np.zeros_like(arr, dtype=float)
+    mask = np.isfinite(arr)
+    if not mask.any():
+        return out
+
+    lo = float(np.nanmin(arr[mask]))
+    hi = float(np.nanmax(arr[mask]))
+    if hi - lo > 1e-8:
+        out[mask] = (arr[mask] - lo) / (hi - lo)
+    else:
+        out[mask] = 1.0
+    if inverse:
+        out[mask] = 1.0 - out[mask]
+    return out
+
+
+def _compute_planar_speed(ts_ms: np.ndarray, x_series: Optional[np.ndarray], y_series: Optional[np.ndarray]) -> np.ndarray:
+    if y_series is None:
+        return np.array([], dtype=float)
+
+    y = np.asarray(y_series, dtype=float)
+    if y.size == 0:
+        return np.array([], dtype=float)
+
+    if x_series is None:
+        x = np.zeros_like(y, dtype=float)
+    else:
+        x = np.asarray(x_series, dtype=float)
+
+    y = _median_filter_1d(_fill_nan(y, gap_max=5), k=5)
+    x = _median_filter_1d(_fill_nan(x, gap_max=5), k=5)
+
+    t = np.asarray(ts_ms, dtype=float) / 1000.0
+    if t.size != y.size:
+        t = np.arange(y.size, dtype=float) / 30.0
+    dt = np.gradient(t)
+    valid_dt = np.isfinite(dt) & (np.abs(dt) > 1e-6)
+    fallback_dt = float(np.nanmedian(dt[valid_dt])) if valid_dt.any() else (1.0 / 30.0)
+    dt = np.where(valid_dt, dt, fallback_dt)
+
+    vx = np.gradient(x) / dt
+    vy = np.gradient(y) / dt
+    speed = np.sqrt(vx * vx + vy * vy)
+    speed[~np.isfinite(speed)] = np.nan
+    return speed
+
+
+def _read_image_unicode(path: str) -> np.ndarray:
+    data = np.fromfile(path, dtype=np.uint8)
+    if data.size == 0:
+        raise RuntimeError(f"Failed to read image bytes: {path}")
+    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if image is None:
+        raise RuntimeError(f"Failed to decode image: {path}")
+    return image
+
+
+def _pick_contact_after_drop(
+    signals: Dict[str, np.ndarray],
+    ts_ms: np.ndarray,
+    drop_idx: Optional[int],
+    min_gap_frames: int = 2,
+) -> Tuple[Optional[int], str]:
+    if drop_idx is None:
+        return None, "unavailable"
+
+    wrist_y = signals.get("racket_wrist_y")
+    if wrist_y is None:
+        return None, "unavailable"
+
+    wrist_y = np.asarray(wrist_y, dtype=float)
+    n = wrist_y.size
+    if n == 0:
+        return None, "unavailable"
+
+    search_start = max(0, int(drop_idx) + max(1, int(min_gap_frames)))
+    if search_start >= n:
+        return None, "invalid_window"
+
+    wrist_s = _median_filter_1d(_fill_nan(wrist_y, gap_max=5), k=5)
+    elbow_angle = signals.get("elbow_angle")
+    elbow_s = None
+    if elbow_angle is not None:
+        elbow_s = _median_filter_1d(_fill_nan(np.asarray(elbow_angle, dtype=float), gap_max=5), k=5)
+
+    speed = _compute_planar_speed(ts_ms, signals.get("racket_wrist_x"), wrist_y)
+
+    head_ref = signals.get("nose_y")
+    if head_ref is not None:
+        head_ref = np.asarray(head_ref, dtype=float).copy()
+    shoulder_refs = []
+    for key in ("left_shoulder_y", "right_shoulder_y"):
+        value = signals.get(key)
+        if value is not None:
+            shoulder_refs.append(np.asarray(value, dtype=float))
+    if shoulder_refs:
+        shoulder_ref = np.nanmax(np.vstack(shoulder_refs), axis=0)
+        if head_ref is None:
+            head_ref = shoulder_ref
+        else:
+            head_ref[~np.isfinite(head_ref)] = shoulder_ref[~np.isfinite(head_ref)]
+
+    idxs = np.arange(search_start, n, dtype=int)
+    wrist_norm = _normalize_finite(wrist_s[idxs])
+    elbow_norm = _normalize_finite(elbow_s[idxs]) if elbow_s is not None else np.zeros_like(wrist_norm)
+    speed_norm = _normalize_finite(speed[idxs]) if speed.size == n else np.zeros_like(wrist_norm)
+
+    if head_ref is not None and len(head_ref) == n:
+        head_gap = wrist_s[idxs] - head_ref[idxs]
+        head_bonus = np.where(
+            np.isfinite(head_gap) & (head_gap > 0.0),
+            1.0,
+            np.where(np.isfinite(head_gap) & (head_gap > -0.02), 0.5, 0.0),
+        )
+    else:
+        head_bonus = np.zeros_like(wrist_norm)
+
+    score = 0.55 * wrist_norm + 0.25 * elbow_norm + 0.15 * speed_norm + 0.05 * head_bonus
+
+    local_peak_mask = np.zeros_like(idxs, dtype=bool)
+    if idxs.size == 1:
+        local_peak_mask[0] = True
+    else:
+        for pos in range(idxs.size):
+            idx = idxs[pos]
+            cur = wrist_s[idx]
+            if not np.isfinite(cur):
+                continue
+            prev = wrist_s[idxs[pos - 1]] if pos > 0 else cur
+            nxt = wrist_s[idxs[pos + 1]] if pos + 1 < idxs.size else cur
+            if (not np.isfinite(prev) or cur >= prev) and (not np.isfinite(nxt) or cur >= nxt):
+                local_peak_mask[pos] = True
+
+    strong_mask = (wrist_norm >= 0.88) & (elbow_norm >= 0.70) & (speed_norm >= 0.30)
+    candidate_mask = local_peak_mask & strong_mask
+    status = "refined_peak"
+    if not candidate_mask.any():
+        candidate_mask = strong_mask
+        status = "refined_score"
+    if not candidate_mask.any():
+        finite_score = np.isfinite(score)
+        if finite_score.any():
+            top_score = float(np.nanmax(score[finite_score]))
+            candidate_mask = finite_score & (score >= top_score * 0.97)
+            status = "refined_relaxed"
+
+    if not candidate_mask.any():
+        finite_score = np.isfinite(score)
+        if not finite_score.any():
+            return None, "unavailable"
+        best_pos = int(np.nanargmax(score))
+        return int(idxs[best_pos]), "refined_fallback"
+
+    candidate_scores = np.where(candidate_mask, score, np.nan)
+    max_score = float(np.nanmax(candidate_scores))
+    plateau_mask = candidate_mask & (score >= max_score * 0.985)
+    if not plateau_mask.any():
+        plateau_mask = candidate_mask
+
+    chosen_pos = int(np.flatnonzero(plateau_mask)[0])
+    return int(idxs[chosen_pos]), status
+
+
 def compute_signals(
     wide: Dict[str, np.ndarray],
     median_k: int = 5,
@@ -645,6 +810,7 @@ def fix_hrp_lrp(
     phases_out = dict(phases)
     phases_out["old_trophy"] = int(old_trophy)
     phases_out["old_drop"] = int(old_drop)
+    contact_status = str(phases.get("contact_status") or "ok")
 
     # ---------- helper: infer y axis direction ----------
     def _infer_y_is_down() -> Optional[bool]:
@@ -708,6 +874,7 @@ def fix_hrp_lrp(
     knee_angle = signals.get("knee_angle")
     trunk_angle = signals.get("trunk_angle")
     elbow_angle = signals.get("elbow_angle")
+    shoulder_tilt_abs = signals.get("shoulder_tilt_abs")
 
     def _find_local_extreme(series: Optional[np.ndarray], s: int, e: int) -> Optional[int]:
         """
@@ -772,36 +939,63 @@ def fix_hrp_lrp(
         if idxs.size == 0:
             return None
 
-        wrist_low = (
-            _norm_segment(wrist_y[idxs], inverse=not y_is_down)
-            if wrist_y is not None
-            else np.zeros_like(idxs, dtype=float)
-        )
-        elbow_low = (
-            _norm_segment(elbow_y[idxs], inverse=not y_is_down)
+        # Racket drop usually happens in the later loading window, not immediately after trophy.
+        if idxs.size >= 12:
+            late_start = s + int(round(0.40 * float(e - s)))
+            idxs = idxs[idxs >= late_start]
+            if idxs.size == 0:
+                return None
+
+        elbow_high = (
+            _norm_segment(elbow_y[idxs], inverse=False)
             if elbow_y is not None
             else np.zeros_like(idxs, dtype=float)
         )
-        knee_extend = _positive_grad_score(knee_angle, idxs)
-        elbow_open = _positive_grad_score(elbow_angle, idxs)
-        trunk_drive = _direct_progress_score(trunk_angle, idxs, new_trophy, contact_idx)
+        shoulder_level = (
+            _norm_segment(shoulder_tilt_abs[idxs], inverse=True)
+            if shoulder_tilt_abs is not None
+            else np.zeros_like(idxs, dtype=float)
+        )
+        trunk_coil = (
+            _norm_segment(trunk_angle[idxs], inverse=True)
+            if trunk_angle is not None
+            else np.zeros_like(idxs, dtype=float)
+        )
+        late_progress = _norm_segment(idxs.astype(np.float64), inverse=False)
 
         score = (
-            0.30 * wrist_low
-            + 0.10 * elbow_low
-            + 0.20 * knee_extend
-            + 0.15 * trunk_drive
-            + 0.25 * elbow_open
+            0.25 * elbow_high
+            + 0.10 * late_progress
+            + 0.50 * shoulder_level
+            + 0.15 * trunk_coil
         )
         valid = np.isfinite(score)
         if not valid.any():
             return None
 
         max_score = float(np.nanmax(score[valid]))
-        keep = valid & (score >= max_score * 0.98)
+        keep = valid & (score >= max_score * 0.985)
         if not keep.any():
             return int(idxs[int(np.nanargmax(score))])
         return int(idxs[np.flatnonzero(keep)[0]])
+
+    def _rerun_drop(current_contact_idx: int) -> Tuple[Optional[int], str]:
+        search_start = new_trophy + min_gap_trophy_drop
+        search_end = current_contact_idx - min_gap_drop_contact
+        if search_start >= search_end:
+            return None, "unscorable_window"
+
+        rerun_drop = _find_lrp_composite(search_start, search_end)
+        rerun_status = "composite_refind_after_forced_trophy"
+        if rerun_drop is None:
+            rerun_drop = _find_local_extreme(wrist_y, search_start, search_end)
+            if rerun_drop is not None:
+                rerun_status = "wrist_extreme_fallback"
+        if rerun_drop is None:
+            rerun_drop = _find_local_extreme(elbow_y, search_start, search_end)
+            if rerun_drop is not None:
+                rerun_status = "elbow_fallback"
+        return rerun_drop, rerun_status
 
     if start < end:
         new_drop = _find_lrp_composite(start, end)
@@ -816,6 +1010,22 @@ def fix_hrp_lrp(
     else:
         drop_status = "unscorable_window"
         new_drop = None
+
+    contact_seed = new_drop if new_drop is not None else old_drop
+    refined_contact, refined_contact_status = _pick_contact_after_drop(
+        signals,
+        ts_ms,
+        drop_idx=contact_seed,
+        min_gap_frames=min_gap_drop_contact,
+    )
+    if refined_contact is not None and refined_contact > new_trophy:
+        contact_idx = int(refined_contact)
+        contact_status = refined_contact_status
+
+        rerun_drop, rerun_status = _rerun_drop(contact_idx)
+        if new_drop is None and rerun_drop is not None:
+            new_drop = int(rerun_drop)
+            drop_status = rerun_status
 
     # ---------- enforce order & minimal gaps (retry once) ----------
     if new_drop is not None:
@@ -851,8 +1061,10 @@ def fix_hrp_lrp(
 
     phases_out["trophy"] = int(new_trophy)
     phases_out["racket_drop"] = None if new_drop is None else int(new_drop)
+    phases_out["contact"] = int(contact_idx)
     phases_out["drop_status"] = drop_status
     phases_out["trophy_status"] = "forced_from_drop"
+    phases_out["contact_status"] = contact_status
     phases_out["y_axis"] = "down" if y_is_down else "up"
 
     # ---------- final hard ordering gate ----------
@@ -1910,42 +2122,6 @@ def analyze_serve(
     metrics_full = selected.get("metrics_full", selected.get("metrics", {}))
     quality_flags = _quality_flags(df, dual["hand_mode_selected"], v_thr=v_thr)
 
-    timing_bad = False
-    for k in ["timing_trophy_to_drop", "timing_drop_to_contact"]:
-        v = metrics_full.get(k, float("nan"))
-        if not np.isfinite(v) or v <= 1e-6:
-            timing_bad = True
-            break
-
-    if timing_bad and use_coords != "raw":
-        fallback = analyze_serve_dual(
-            df,
-            use_coords="raw",
-            weights=weights,
-            median_k=median_k,
-            hand_mode=dual["hand_mode_selected"],
-            gap_max=gap_max,
-            quantile_calib=quantile_calib,
-        )
-        fallback_sel = fallback["selected"]
-        ok = True
-        for k in ["timing_trophy_to_drop", "timing_drop_to_contact"]:
-            v = fallback_sel["metrics"].get(k, float("nan"))
-            if not np.isfinite(v) or v <= 1e-6:
-                ok = False
-                break
-        if ok:
-            metrics_full.update({
-                "timing_toss_to_trophy": fallback_sel["metrics"].get("timing_toss_to_trophy"),
-                "timing_trophy_to_drop": fallback_sel["metrics"].get("timing_trophy_to_drop"),
-                "timing_drop_to_contact": fallback_sel["metrics"].get("timing_drop_to_contact"),
-            })
-            selected["phases"] = fallback_sel["phases"]
-            selected["subscores"], selected["final_score"] = score_metrics(metrics_full, weights=weights)
-            quality_flags["timing_fallback"] = "raw"
-        else:
-            quality_flags["timing_fallback"] = "failed"
-
     metrics_out = selected.get("metrics_min") or {}
     if not metrics_out:
         metrics_out = metrics_full
@@ -2549,6 +2725,7 @@ def render_projected_mesh_overlay(
     outline_color_bgr: Tuple[int, int, int] = (154, 136, 113),
     target_bbox_xyxy: Optional[Iterable[float]] = None,
     target_fill_ratio: float = 0.98,
+    fit_bbox_quantile: float = 0.01,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
     if image_bgr is None or image_bgr.size == 0:
         raise RuntimeError("Expected a valid BGR image for mesh overlay rendering.")
@@ -2565,8 +2742,15 @@ def render_projected_mesh_overlay(
     valid_points = verts_2d[valid_vertices]
     if target_bbox_xyxy is not None and valid_points.size:
         tx1, ty1, tx2, ty2 = [float(v) for v in target_bbox_xyxy]
-        mesh_min = valid_points.min(axis=0)
-        mesh_max = valid_points.max(axis=0)
+        raw_mesh_min = valid_points.min(axis=0)
+        raw_mesh_max = valid_points.max(axis=0)
+        quantile = float(np.clip(fit_bbox_quantile, 0.0, 0.49))
+        if quantile > 0.0 and valid_points.shape[0] >= 16:
+            mesh_min = np.quantile(valid_points, quantile, axis=0)
+            mesh_max = np.quantile(valid_points, 1.0 - quantile, axis=0)
+        else:
+            mesh_min = raw_mesh_min
+            mesh_max = raw_mesh_max
         mesh_size = np.maximum(mesh_max - mesh_min, 1e-6)
         mesh_center = (mesh_min + mesh_max) / 2.0
         target_center = np.array([(tx1 + tx2) / 2.0, (ty1 + ty2) / 2.0], dtype=float)
@@ -2576,9 +2760,11 @@ def render_projected_mesh_overlay(
         transform_debug = {
             "target_bbox_xyxy": [tx1, ty1, tx2, ty2],
             "target_fill_ratio": float(target_fill_ratio),
+            "fit_bbox_quantile": quantile,
             "overlay_scale": scale,
             "overlay_shift_xy": (target_center - mesh_center * scale).tolist(),
-            "mesh_bbox_before_xyxy": [float(mesh_min[0]), float(mesh_min[1]), float(mesh_max[0]), float(mesh_max[1])],
+            "mesh_bbox_before_xyxy": [float(raw_mesh_min[0]), float(raw_mesh_min[1]), float(raw_mesh_max[0]), float(raw_mesh_max[1])],
+            "mesh_bbox_ref_xyxy": [float(mesh_min[0]), float(mesh_min[1]), float(mesh_max[0]), float(mesh_max[1])],
             "mesh_bbox_after_xyxy": [
                 float(np.nanmin(verts_2d[valid_vertices, 0])),
                 float(np.nanmin(verts_2d[valid_vertices, 1])),
@@ -2660,9 +2846,7 @@ def render_hybrik_mesh_overlay(
     fit_to_detector_bbox: bool = True,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
     if isinstance(image_or_path, str):
-        image_bgr = cv2.imread(image_or_path)
-        if image_bgr is None:
-            raise RuntimeError(f"Failed to read image: {image_or_path}")
+        image_bgr = _read_image_unicode(image_or_path)
         image_path = os.path.abspath(image_or_path)
     else:
         image_bgr = np.asarray(image_or_path).copy()

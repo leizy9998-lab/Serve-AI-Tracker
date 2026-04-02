@@ -1,18 +1,24 @@
 import argparse
 import html as html_lib
+import inspect
 import json
+import math
 import time
 import os
+import pickle
+import shutil
 import subprocess
 import sys
-from typing import Dict, List, Optional, Tuple
+import tempfile
+from collections import namedtuple
+from contextlib import contextmanager
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
 import pandas as pd
 
 import serve_score
-from i18n_zh import zh_label
 from i18n_zh import zh_label
 
 
@@ -152,6 +158,786 @@ def _posix_path(path: str) -> str:
     return path.replace("\\", "/")
 
 
+def _read_image_unicode(path: str) -> Optional[np.ndarray]:
+    try:
+        data = np.fromfile(path, dtype=np.uint8)
+    except OSError:
+        return None
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+
+def _write_image_unicode(path: str, image: np.ndarray) -> None:
+    ext = os.path.splitext(path)[1] or ".png"
+    ok, encoded = cv2.imencode(ext, image)
+    if not ok:
+        raise RuntimeError(f"Failed to encode image: {path}")
+    encoded.tofile(path)
+
+
+def _can_open_video(path: str) -> bool:
+    cap = cv2.VideoCapture(path)
+    ok = cap.isOpened()
+    cap.release()
+    return ok
+
+
+def _prepare_video_input(video_path: str) -> Tuple[str, Optional[str]]:
+    if _can_open_video(video_path):
+        return video_path, None
+
+    suffix = os.path.splitext(video_path)[1] or ".mp4"
+    tmp_dir = os.path.join(tempfile.gettempdir(), "serve_ai_inputs")
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_path = os.path.join(tmp_dir, f"serve_input_{int(time.time() * 1000)}{suffix}")
+    shutil.copyfile(video_path, tmp_path)
+    if _can_open_video(tmp_path):
+        return tmp_path, tmp_path
+    raise RuntimeError(f"Cannot open video even after staging to ASCII temp path: {video_path}")
+
+
+def _remove_path(path: Optional[str]) -> None:
+    if not path or not os.path.exists(path):
+        return
+    if os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _cleanup_compact_outputs(out_dir: str, generated_pose_csv: Optional[str]) -> None:
+    _remove_path(generated_pose_csv)
+    _remove_path(os.path.join(out_dir, "score_debug.json"))
+    _remove_path(os.path.join(out_dir, "plots"))
+    _remove_path(os.path.join(out_dir, "keyframes"))
+
+    for phase in KEYFRAME_3D_PHASES:
+        phase_dir = os.path.join(out_dir, "keyframe_3d", phase)
+        _remove_path(os.path.join(phase_dir, "hybrik"))
+        _remove_path(os.path.join(phase_dir, "mesh_overlay.png"))
+
+
+POSE_CONNECTIONS = [
+    (11, 13), (13, 15), (12, 14), (14, 16),
+    (11, 12), (11, 23), (12, 24), (23, 24),
+    (23, 25), (25, 27), (24, 26), (26, 28),
+    (27, 29), (28, 30), (29, 31), (30, 32),
+    (15, 17), (15, 19), (15, 21),
+    (16, 18), (16, 20), (16, 22),
+]
+
+DEFAULT_HYBRIK_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "third_party", "HybrIK-main")
+DEFAULT_HYBRIK_CONFIG = "configs/256x192_adam_lr1e-3-hrw48_cam_2x_w_pw3d_3dhp.yaml"
+DEFAULT_HYBRIK_CHECKPOINT = os.path.join("pretrained_models", "hybrik_hrnet.pth")
+HYBRIK_JOINT_NAMES_29 = [
+    "pelvis",
+    "left_hip",
+    "right_hip",
+    "spine1",
+    "left_knee",
+    "right_knee",
+    "spine2",
+    "left_ankle",
+    "right_ankle",
+    "spine3",
+    "left_foot",
+    "right_foot",
+    "neck",
+    "left_collar",
+    "right_collar",
+    "jaw",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_thumb",
+    "right_thumb",
+    "head",
+    "left_middle",
+    "right_middle",
+    "left_bigtoe",
+    "right_bigtoe",
+]
+
+
+def _pose_alpha(cutoff_hz: float, dt: float) -> float:
+    tau = 1.0 / (2.0 * math.pi * cutoff_hz)
+    return 1.0 / (1.0 + tau / max(dt, 1e-6))
+
+
+class _PoseLowPass:
+    def __init__(self) -> None:
+        self.inited = False
+        self.y = 0.0
+
+    def apply(self, x: float, a: float) -> float:
+        if not self.inited:
+            self.inited = True
+            self.y = x
+            return x
+        self.y = a * x + (1.0 - a) * self.y
+        return self.y
+
+
+class _PoseOneEuro:
+    def __init__(self, min_cutoff: float = 1.2, beta: float = 0.6, d_cutoff: float = 1.0) -> None:
+        self.min_cutoff = float(min_cutoff)
+        self.beta = float(beta)
+        self.d_cutoff = float(d_cutoff)
+        self.x_prev: Optional[float] = None
+        self.dx_lp = _PoseLowPass()
+        self.x_lp = _PoseLowPass()
+
+    def apply(self, x: float, dt: float) -> float:
+        if self.x_prev is None:
+            self.x_prev = x
+            return x
+        dx = (x - self.x_prev) / max(dt, 1e-6)
+        a_d = _pose_alpha(self.d_cutoff, dt)
+        dx_hat = self.dx_lp.apply(dx, a_d)
+        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
+        a = _pose_alpha(cutoff, dt)
+        x_hat = self.x_lp.apply(x, a)
+        self.x_prev = x_hat
+        return x_hat
+
+
+def _pose_interp_short(arr: np.ndarray, gap_max: int) -> np.ndarray:
+    if arr.size == 0:
+        return arr
+    return pd.Series(arr).interpolate(limit=int(gap_max), limit_direction="both").to_numpy()
+
+
+def _pose_centered_moving_average(arr: np.ndarray, window: int) -> np.ndarray:
+    if arr.size == 0:
+        return arr
+    window = int(max(window, 1))
+    if window % 2 == 0:
+        window += 1
+    if window <= 1:
+        return arr
+    valid = np.isfinite(arr)
+    vals = np.where(valid, arr, 0.0)
+    kernel = np.ones(window, dtype=np.float64)
+    sm = np.convolve(vals, kernel, mode="same")
+    cnt = np.convolve(valid.astype(np.float64), kernel, mode="same")
+    return np.where(cnt > 0, sm / cnt, np.nan)
+
+
+def _pose_smooth_sequence(
+    raw: np.ndarray,
+    vis: np.ndarray,
+    mode: str,
+    v_thr: float,
+    gap_max: int,
+    window: int,
+    dt: float,
+    min_cutoff: float,
+    beta: float,
+    d_cutoff: float,
+) -> np.ndarray:
+    arr = raw.astype(np.float64).copy()
+    arr[(~np.isfinite(arr)) | (vis < v_thr)] = np.nan
+    mode = (mode or "zero_phase").lower()
+    if mode == "zero_phase":
+        interp = _pose_interp_short(arr, gap_max=gap_max)
+        smoothed = _pose_centered_moving_average(interp, window=window)
+        smoothed[np.isnan(interp)] = np.nan
+        return smoothed
+
+    out = np.full_like(arr, np.nan, dtype=np.float64)
+    filt = _PoseOneEuro(min_cutoff=min_cutoff, beta=beta, d_cutoff=d_cutoff)
+    for idx, value in enumerate(arr):
+        if not np.isfinite(value):
+            out[idx] = np.nan
+            filt.x_prev = None
+            continue
+        out[idx] = filt.apply(value, dt)
+    return out
+
+
+def _pose_draw(frame: np.ndarray, lm_xy: Dict[int, Tuple[float, float]], color: Tuple[int, int, int] = (0, 255, 0), thickness: int = 2) -> None:
+    height, width = frame.shape[:2]
+    for a, b in POSE_CONNECTIONS:
+        if a not in lm_xy or b not in lm_xy:
+            continue
+        ax, ay = lm_xy[a]
+        bx, by = lm_xy[b]
+        cv2.line(
+            frame,
+            (int(ax * width), int(ay * height)),
+            (int(bx * width), int(by * height)),
+            color,
+            thickness,
+            cv2.LINE_AA,
+        )
+    for x, y in lm_xy.values():
+        cv2.circle(frame, (int(x * width), int(y * height)), 3, (0, 0, 255), -1, cv2.LINE_AA)
+
+
+def _pose_put_label(frame: np.ndarray, text: str, org: Tuple[int, int] = (20, 60), color: Tuple[int, int, int] = (255, 255, 255)) -> None:
+    cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 0), 6, cv2.LINE_AA)
+    cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, 1.4, color, 2, cv2.LINE_AA)
+
+
+def _pose_build_lm_xy(x_row: np.ndarray, y_row: np.ndarray, v_row: np.ndarray, v_thr: float) -> Dict[int, Tuple[float, float]]:
+    lm_xy: Dict[int, Tuple[float, float]] = {}
+    for idx in range(len(x_row)):
+        x = x_row[idx]
+        y = y_row[idx]
+        vis = v_row[idx]
+        if not np.isfinite(x) or not np.isfinite(y) or vis < v_thr:
+            continue
+        lm_xy[idx] = (float(x), float(y))
+    return lm_xy
+
+
+def run_pose_extraction(
+    video: str,
+    model: str,
+    out_csv: str,
+    out_video: str,
+    num_poses: int = 2,
+    min_det: float = 0.5,
+    min_presence: float = 0.5,
+    min_track: float = 0.6,
+    min_cutoff: float = 1.2,
+    beta: float = 0.6,
+    d_cutoff: float = 1.0,
+    vis_gate: float = 0.6,
+    v_thr: Optional[float] = None,
+    smooth_mode: str = "zero_phase",
+    gap_max: int = 3,
+    smooth_window: int = 9,
+) -> Dict[str, str]:
+    import mediapipe as mp
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import vision
+
+    _ensure_dir(os.path.dirname(os.path.abspath(out_csv)))
+    _ensure_dir(os.path.dirname(os.path.abspath(out_video)))
+
+    cap = cv2.VideoCapture(video)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 60.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    dt = 1.0 / float(fps)
+
+    base_options = python.BaseOptions(model_asset_path=model)
+    options = vision.PoseLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.VIDEO,
+        num_poses=num_poses,
+        min_pose_detection_confidence=min_det,
+        min_pose_presence_confidence=min_presence,
+        min_tracking_confidence=min_track,
+    )
+    landmarker = vision.PoseLandmarker.create_from_options(options)
+    v_thr_value = vis_gate if v_thr is None else float(v_thr)
+
+    prev_center: Optional[Tuple[float, float]] = None
+    raw_x_list: List[np.ndarray] = []
+    raw_y_list: List[np.ndarray] = []
+    vis_list: List[np.ndarray] = []
+    ts_list: List[int] = []
+    frame_idx = 0
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        ts_ms = int(frame_idx * 1000.0 / fps)
+        ts_list.append(ts_ms)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = landmarker.detect_for_video(mp_img, ts_ms)
+
+        arr_x = np.full(33, np.nan, dtype=np.float64)
+        arr_y = np.full(33, np.nan, dtype=np.float64)
+        arr_v = np.full(33, 0.0, dtype=np.float64)
+
+        if result.pose_landmarks:
+            if len(result.pose_landmarks) == 1 or prev_center is None:
+                chosen = 0
+            else:
+                centers: List[Tuple[float, float]] = []
+                for landmarks in result.pose_landmarks:
+                    if len(landmarks) > 24:
+                        cx = (landmarks[23].x + landmarks[24].x) * 0.5
+                        cy = (landmarks[23].y + landmarks[24].y) * 0.5
+                    else:
+                        cx = float(np.mean([lm.x for lm in landmarks]))
+                        cy = float(np.mean([lm.y for lm in landmarks]))
+                    centers.append((float(cx), float(cy)))
+                dists = [
+                    (centers[idx][0] - prev_center[0]) ** 2 + (centers[idx][1] - prev_center[1]) ** 2
+                    for idx in range(len(centers))
+                ]
+                chosen = int(np.argmin(dists))
+
+            landmarks = result.pose_landmarks[chosen]
+            if len(landmarks) > 24:
+                prev_center = ((landmarks[23].x + landmarks[24].x) * 0.5, (landmarks[23].y + landmarks[24].y) * 0.5)
+            for idx, lm in enumerate(landmarks):
+                arr_x[idx] = float(lm.x)
+                arr_y[idx] = float(lm.y)
+                arr_v[idx] = float(getattr(lm, "visibility", 1.0))
+
+        raw_x_list.append(arr_x)
+        raw_y_list.append(arr_y)
+        vis_list.append(arr_v)
+        frame_idx += 1
+
+    cap.release()
+
+    raw_x = np.stack(raw_x_list, axis=0) if raw_x_list else np.zeros((0, 33), dtype=np.float64)
+    raw_y = np.stack(raw_y_list, axis=0) if raw_y_list else np.zeros((0, 33), dtype=np.float64)
+    vis = np.stack(vis_list, axis=0) if vis_list else np.zeros((0, 33), dtype=np.float64)
+    ts_ms = np.array(ts_list, dtype=np.int64)
+
+    smooth_x = np.full_like(raw_x, np.nan, dtype=np.float64)
+    smooth_y = np.full_like(raw_y, np.nan, dtype=np.float64)
+    for lm_id in range(raw_x.shape[1] if raw_x.ndim == 2 else 0):
+        smooth_x[:, lm_id] = _pose_smooth_sequence(
+            raw_x[:, lm_id],
+            vis[:, lm_id],
+            mode=smooth_mode,
+            v_thr=v_thr_value,
+            gap_max=gap_max,
+            window=smooth_window,
+            dt=dt,
+            min_cutoff=min_cutoff,
+            beta=beta,
+            d_cutoff=d_cutoff,
+        )
+        smooth_y[:, lm_id] = _pose_smooth_sequence(
+            raw_y[:, lm_id],
+            vis[:, lm_id],
+            mode=smooth_mode,
+            v_thr=v_thr_value,
+            gap_max=gap_max,
+            window=smooth_window,
+            dt=dt,
+            min_cutoff=min_cutoff,
+            beta=beta,
+            d_cutoff=d_cutoff,
+        )
+
+    cap = cv2.VideoCapture(video)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(out_video, fourcc, fps, (width, height))
+    if not writer.isOpened():
+        raise RuntimeError(f"Cannot open VideoWriter: {out_video}")
+
+    frame_idx = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok or frame_idx >= len(ts_ms):
+            break
+        overlay = frame.copy()
+        smooth_xy = _pose_build_lm_xy(smooth_x[frame_idx], smooth_y[frame_idx], vis[frame_idx], v_thr_value)
+        _pose_draw(overlay, smooth_xy, color=(0, 255, 0), thickness=2)
+        _pose_put_label(overlay, f"SMOOTH {smooth_mode.upper()}", color=(120, 255, 120))
+        writer.write(overlay)
+        frame_idx += 1
+
+    cap.release()
+    writer.release()
+
+    rows: List[Dict[str, object]] = []
+    for frame_idx in range(len(ts_ms)):
+        for lm_id in range(33):
+            rows.append(
+                {
+                    "frame": frame_idx,
+                    "ts_ms": int(ts_ms[frame_idx]),
+                    "lm": lm_id,
+                    "smooth_x": smooth_x[frame_idx, lm_id],
+                    "smooth_y": smooth_y[frame_idx, lm_id],
+                    "vis": vis[frame_idx, lm_id],
+                }
+            )
+    pd.DataFrame(rows).to_csv(out_csv, index=False, encoding="utf-8-sig")
+    return {"pose_csv": out_csv, "pose_video": out_video}
+
+
+def extract_pose_compare_main(argv: Optional[List[str]] = None) -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--video", required=True)
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--out_csv", required=True)
+    ap.add_argument("--out_video", required=True)
+    ap.add_argument("--num_poses", type=int, default=2)
+    ap.add_argument("--min_det", type=float, default=0.5)
+    ap.add_argument("--min_presence", type=float, default=0.5)
+    ap.add_argument("--min_track", type=float, default=0.6)
+    ap.add_argument("--min_cutoff", type=float, default=1.2)
+    ap.add_argument("--beta", type=float, default=0.6)
+    ap.add_argument("--d_cutoff", type=float, default=1.0)
+    ap.add_argument("--vis_gate", type=float, default=0.6)
+    ap.add_argument("--v_thr", type=float, default=None)
+    ap.add_argument("--smooth_mode", choices=["causal", "zero_phase"], default="zero_phase")
+    ap.add_argument("--gap_max", type=int, default=3)
+    ap.add_argument("--smooth_window", type=int, default=9)
+    args = ap.parse_args(argv)
+    result = run_pose_extraction(
+        video=args.video,
+        model=args.model,
+        out_csv=args.out_csv,
+        out_video=args.out_video,
+        num_poses=args.num_poses,
+        min_det=args.min_det,
+        min_presence=args.min_presence,
+        min_track=args.min_track,
+        min_cutoff=args.min_cutoff,
+        beta=args.beta,
+        d_cutoff=args.d_cutoff,
+        vis_gate=args.vis_gate,
+        v_thr=args.v_thr,
+        smooth_mode=args.smooth_mode,
+        gap_max=args.gap_max,
+        smooth_window=args.smooth_window,
+    )
+    print(f"[OK] out_video: {result['pose_video']}")
+    print(f"[OK] out_csv  : {result['pose_csv']}")
+
+
+def _hybrik_prepare_numpy_compat() -> None:
+    if not hasattr(inspect, "getargspec"):
+        arg_spec = namedtuple("ArgSpec", ["args", "varargs", "keywords", "defaults"])
+
+        def _getargspec_compat(func: Any) -> Any:
+            spec = inspect.getfullargspec(func)
+            return arg_spec(spec.args, spec.varargs, spec.varkw, spec.defaults)
+
+        inspect.getargspec = _getargspec_compat
+
+    for alias, value in {
+        "bool": bool,
+        "int": int,
+        "float": float,
+        "complex": complex,
+        "object": object,
+        "unicode": str,
+        "str": str,
+    }.items():
+        if alias not in np.__dict__:
+            setattr(np, alias, value)
+
+
+@contextmanager
+def _hybrik_pushd(path: str) -> Iterable[None]:
+    prev = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(prev)
+
+
+def _hybrik_resolve_path(root: str, path: str) -> str:
+    return path if os.path.isabs(path) else os.path.join(root, path)
+
+
+def _hybrik_xyxy_to_xywh(bbox: List[float]) -> List[float]:
+    x1, y1, x2, y2 = bbox
+    return [(x1 + x2) / 2.0, (y1 + y2) / 2.0, x2 - x1, y2 - y1]
+
+
+def _hybrik_write_obj(path: str, vertices: np.ndarray, faces: np.ndarray) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for x, y, z in vertices:
+            f.write(f"v {x:.8f} {y:.8f} {z:.8f}\n")
+        for tri in faces:
+            a, b, c = tri.astype(int) + 1
+            f.write(f"f {a} {b} {c}\n")
+
+
+def _hybrik_to_builtin(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _hybrik_to_builtin(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_hybrik_to_builtin(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    return value
+
+
+def _load_hybrik_modules(hybrik_root: str) -> Any:
+    _hybrik_prepare_numpy_compat()
+    if hybrik_root not in sys.path:
+        sys.path.insert(0, hybrik_root)
+    from hybrik.models import builder
+    from hybrik.utils.config import update_config
+    from hybrik.utils.presets import SimpleTransform3DSMPLCam
+    from hybrik.utils.vis import get_one_box, vis_2d, vis_bbox
+
+    return builder, update_config, SimpleTransform3DSMPLCam, get_one_box, vis_2d, vis_bbox
+
+
+def _build_hybrik_transform(cfg: Any, transform_cls: Any) -> Any:
+    from easydict import EasyDict as edict
+
+    bbox_3d_shape = getattr(cfg.MODEL, "BBOX_3D_SHAPE", (2000, 2000, 2000))
+    bbox_3d_shape = [item * 1e-3 for item in bbox_3d_shape]
+    dummy_set = edict(
+        {
+            "joint_pairs_17": None,
+            "joint_pairs_24": None,
+            "joint_pairs_29": None,
+            "bbox_3d_shape": bbox_3d_shape,
+        }
+    )
+    return transform_cls(
+        dummy_set,
+        scale_factor=cfg.DATASET.SCALE_FACTOR,
+        color_factor=cfg.DATASET.COLOR_FACTOR,
+        occlusion=cfg.DATASET.OCCLUSION,
+        input_size=cfg.MODEL.IMAGE_SIZE,
+        output_size=cfg.MODEL.HEATMAP_SIZE,
+        depth_dim=cfg.MODEL.EXTRA.DEPTH_DIM,
+        bbox_3d_shape=bbox_3d_shape,
+        rot=cfg.DATASET.ROT_FACTOR,
+        sigma=cfg.MODEL.EXTRA.SIGMA,
+        train=False,
+        add_dpg=False,
+        loss_type=cfg.LOSS["TYPE"],
+    )
+
+
+def _load_hybrik_state_dict(model: Any, checkpoint_path: str) -> None:
+    import torch
+
+    save_dict = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(save_dict, dict) and "model" in save_dict:
+        model.load_state_dict(save_dict["model"])
+    else:
+        model.load_state_dict(save_dict)
+
+
+def run_hybrik_inference(
+    image_path: str,
+    out_dir: str,
+    hybrik_root: str = DEFAULT_HYBRIK_ROOT,
+    config_path: str = DEFAULT_HYBRIK_CONFIG,
+    checkpoint_path: str = DEFAULT_HYBRIK_CHECKPOINT,
+    detector_score_threshold: float = 0.9,
+    device_name: str = "auto",
+) -> Dict[str, Any]:
+    import torch
+    from torchvision.models.detection import FasterRCNN_ResNet50_FPN_Weights, fasterrcnn_resnet50_fpn
+
+    builder, update_config, transform_cls, get_one_box, vis_2d, vis_bbox = _load_hybrik_modules(hybrik_root)
+    config_abs = _hybrik_resolve_path(hybrik_root, config_path)
+    checkpoint_abs = _hybrik_resolve_path(hybrik_root, checkpoint_path)
+
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    if not os.path.exists(config_abs):
+        raise FileNotFoundError(f"Config not found: {config_abs}")
+    if not os.path.exists(checkpoint_abs):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_abs}")
+
+    if device_name == "auto":
+        device_name = "cuda:0" if torch.cuda.is_available() else "cpu"
+    if device_name.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA device requested but torch.cuda.is_available() is False.")
+    device = torch.device(device_name)
+
+    _ensure_dir(out_dir)
+    image_bgr = _read_image_unicode(image_path)
+    if image_bgr is None:
+        raise RuntimeError(f"Failed to decode image: {image_path}")
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+    with _hybrik_pushd(hybrik_root):
+        cfg = update_config(config_abs)
+        transform = _build_hybrik_transform(cfg, transform_cls)
+        det_model = fasterrcnn_resnet50_fpn(weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT)
+        det_model.to(device)
+        det_model.eval()
+
+        hybrik_model = builder.build_sppe(cfg.MODEL)
+        _load_hybrik_state_dict(hybrik_model, checkpoint_abs)
+        hybrik_model.to(device)
+        hybrik_model.eval()
+
+        with torch.no_grad():
+            det_input = torch.from_numpy(image_rgb.transpose(2, 0, 1)).float().div(255.0).to(device)
+            det_output = det_model([det_input])[0]
+            tight_bbox = get_one_box(det_output, thrd=detector_score_threshold)
+            if tight_bbox is None:
+                raise RuntimeError("No person bounding box detected in the input image.")
+
+            pose_input, bbox, img_center = transform.test_transform(image_rgb, tight_bbox)
+            pose_input = pose_input.to(device)[None, :, :, :]
+            pose_output = hybrik_model(
+                pose_input,
+                flip_test=True,
+                bboxes=torch.from_numpy(np.array(bbox)).to(device).unsqueeze(0).float(),
+                img_center=torch.from_numpy(img_center).to(device).unsqueeze(0).float(),
+            )
+
+    pred_xyz_17 = pose_output.pred_xyz_jts_17.reshape(17, 3).detach().cpu().numpy()
+    pred_xyz_29 = pose_output.pred_xyz_jts_29.reshape(29, 3).detach().cpu().numpy()
+    pred_xyz_24_struct = pose_output.pred_xyz_jts_24_struct.reshape(24, 3).detach().cpu().numpy()
+    pred_uvd = pose_output.pred_uvd_jts.reshape(-1, 3).detach().cpu().numpy()
+    pred_scores = pose_output.maxvals.detach().cpu().reshape(-1).numpy()[:29]
+    pred_camera = pose_output.pred_camera.squeeze(0).detach().cpu().numpy()
+    pred_betas = pose_output.pred_shape.squeeze(0).detach().cpu().numpy()
+    pred_phi = pose_output.pred_phi.squeeze(0).detach().cpu().numpy()
+    pred_theta = pose_output.pred_theta_mats.squeeze(0).detach().cpu().numpy().reshape(24, 3, 3)
+    pred_vertices = pose_output.pred_vertices.squeeze(0).detach().cpu().numpy()
+    transl = pose_output.transl.squeeze(0).detach().cpu().numpy()
+    cam_root = pose_output.cam_root.squeeze(0).detach().cpu().numpy()
+    faces = hybrik_model.smpl.faces.astype(np.int32)
+
+    bbox_xywh = _hybrik_xyxy_to_xywh(bbox)
+    points_2d = pred_uvd[:, :2].copy() * bbox_xywh[2]
+    points_2d[:, 0] += bbox_xywh[0]
+    points_2d[:, 1] += bbox_xywh[1]
+
+    bbox_vis = cv2.cvtColor(vis_bbox(image_rgb.copy(), tight_bbox), cv2.COLOR_RGB2BGR)
+    joints_vis = cv2.cvtColor(vis_2d(image_rgb.copy(), tight_bbox, points_2d), cv2.COLOR_RGB2BGR)
+    overlay = image_bgr.copy()
+    for idx, (x, y) in enumerate(points_2d):
+        cv2.circle(overlay, (int(round(x)), int(round(y))), 4, (0, 255, 255), -1)
+        cv2.putText(
+            overlay,
+            str(idx),
+            (int(round(x)) + 4, int(round(y)) - 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            (0, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    cv2.rectangle(
+        overlay,
+        (int(round(tight_bbox[0])), int(round(tight_bbox[1]))),
+        (int(round(tight_bbox[2])), int(round(tight_bbox[3]))),
+        (0, 0, 255),
+        2,
+    )
+
+    overlay_path = os.path.join(out_dir, "overlay.jpg")
+    bbox_path = os.path.join(out_dir, "bbox_2d.jpg")
+    joints_2d_path = os.path.join(out_dir, "joints_2d.jpg")
+    obj_path = os.path.join(out_dir, "mesh.obj")
+    json_path = os.path.join(out_dir, "joints3d.json")
+    pkl_path = os.path.join(out_dir, "result.pkl")
+
+    _write_image_unicode(overlay_path, overlay)
+    _write_image_unicode(bbox_path, bbox_vis)
+    _write_image_unicode(joints_2d_path, joints_vis)
+    _hybrik_write_obj(obj_path, pred_vertices, faces)
+
+    json_payload = {
+        "image_path": os.path.abspath(image_path),
+        "bbox_xyxy": [float(v) for v in bbox],
+        "detector_bbox_xyxy": [float(v) for v in tight_bbox],
+        "camera": pred_camera,
+        "translation": transl,
+        "cam_root": cam_root,
+        "betas": pred_betas,
+        "phi": pred_phi,
+        "theta_mats": pred_theta,
+        "joints_3d_17": pred_xyz_17,
+        "joints_3d_24_struct": pred_xyz_24_struct,
+        "joints_3d_29": [
+            {
+                "index": idx,
+                "name": HYBRIK_JOINT_NAMES_29[idx] if idx < len(HYBRIK_JOINT_NAMES_29) else f"joint_{idx}",
+                "xyz": pred_xyz_29[idx],
+                "uvd": pred_uvd[idx],
+                "score": float(pred_scores[idx]) if idx < len(pred_scores) else None,
+            }
+            for idx in range(pred_xyz_29.shape[0])
+        ],
+        "vertices_count": int(pred_vertices.shape[0]),
+        "faces_count": int(faces.shape[0]),
+        "device": str(device),
+        "hybrik_root": os.path.abspath(hybrik_root),
+        "config_path": os.path.abspath(config_abs),
+        "checkpoint_path": os.path.abspath(checkpoint_abs),
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(_hybrik_to_builtin(json_payload), f, ensure_ascii=False, indent=2)
+
+    pickle_payload = {
+        "bbox_xyxy": np.array(bbox),
+        "detector_bbox_xyxy": np.array(tight_bbox),
+        "pred_xyz_17": pred_xyz_17,
+        "pred_xyz_29": pred_xyz_29,
+        "pred_xyz_24_struct": pred_xyz_24_struct,
+        "pred_uvd": pred_uvd,
+        "pred_scores": pred_scores,
+        "pred_camera": pred_camera,
+        "pred_betas": pred_betas,
+        "pred_phi": pred_phi,
+        "pred_theta_mats": pred_theta,
+        "pred_vertices": pred_vertices,
+        "transl": transl,
+        "cam_root": cam_root,
+        "joint_names_29": HYBRIK_JOINT_NAMES_29,
+        "image_path": os.path.abspath(image_path),
+        "config_path": os.path.abspath(config_abs),
+        "checkpoint_path": os.path.abspath(checkpoint_abs),
+    }
+    with open(pkl_path, "wb") as f:
+        pickle.dump(pickle_payload, f)
+
+    return {
+        "overlay_path": overlay_path,
+        "bbox_path": bbox_path,
+        "joints_2d_path": joints_2d_path,
+        "obj_path": obj_path,
+        "json_path": json_path,
+        "pkl_path": pkl_path,
+        "bbox": bbox,
+        "device": str(device),
+    }
+
+
+def run_hybrik_image_main(argv: Optional[List[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description="Run HybrIK on a single image and export 3D joints plus SMPL mesh.")
+    parser.add_argument("--image", required=True)
+    parser.add_argument("--out_dir", default=os.path.join("out", "hybrik_image"))
+    parser.add_argument("--hybrik_root", default=DEFAULT_HYBRIK_ROOT)
+    parser.add_argument("--config", default=DEFAULT_HYBRIK_CONFIG)
+    parser.add_argument("--checkpoint", default=DEFAULT_HYBRIK_CHECKPOINT)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--det_score_thr", type=float, default=0.9)
+    args = parser.parse_args(argv)
+    result = run_hybrik_inference(
+        image_path=args.image,
+        out_dir=args.out_dir,
+        hybrik_root=args.hybrik_root,
+        config_path=args.config,
+        checkpoint_path=args.checkpoint,
+        detector_score_threshold=args.det_score_thr,
+        device_name=args.device,
+    )
+    print(f"Device: {result['device']}")
+    print(f"BBox: {result['bbox']}")
+    print(f"OBJ: {result['obj_path']}")
+    print(f"JSON: {result['json_path']}")
+    print(f"PKL: {result['pkl_path']}")
+    print(f"Overlay: {result['overlay_path']}")
+
+
 def _run_extract(
     video: str,
     model: str,
@@ -164,7 +950,8 @@ def _run_extract(
 ) -> Dict[str, str]:
     cmd = [
         sys.executable,
-        os.path.join(os.path.dirname(__file__), "extract_pose_compare.py"),
+        os.path.abspath(__file__),
+        "__extract_pose",
         "--video",
         video,
         "--model",
@@ -213,7 +1000,7 @@ def _save_keyframes(video: str, phases: Dict[str, int], out_dir: str) -> Dict[st
         if not ok:
             continue
         out_path = os.path.join(key_dir, f"{name}.png")
-        cv2.imwrite(out_path, frame)
+        _write_image_unicode(out_path, frame)
         outputs[name] = _posix_path(os.path.join("keyframes", f"{name}.png"))
 
     cap.release()
@@ -579,16 +1366,16 @@ def _maybe_generate_3d_verification(
 
     hybrik_dir = os.path.join(verify_dir, "hybrik")
     _ensure_dir(hybrik_dir)
-    run_hybrik_script = os.path.join(os.path.dirname(__file__), "run_hybrik_image.py")
     verify_script = os.path.join(os.path.dirname(__file__), "verify_trophy_3d.py")
-    if not os.path.exists(run_hybrik_script) or not os.path.exists(verify_script):
+    if not os.path.exists(verify_script):
         print("[INFO] 3D verification skipped (helper scripts missing).")
         return existing
 
     try:
         cmd_hybrik = [
             servepose_python,
-            run_hybrik_script,
+            os.path.abspath(__file__),
+            "__run_hybrik_image",
             "--image",
             trophy_image_path,
             "--out_dir",
@@ -653,7 +1440,7 @@ def _save_compare_image(
     compare_path: str,
     lang: str,
 ) -> None:
-    original = cv2.imread(image_path)
+    original = _read_image_unicode(image_path)
     if original is None:
         raise RuntimeError(f"Failed to read image: {image_path}")
 
@@ -668,7 +1455,7 @@ def _save_compare_image(
         cv2.putText(compare, text, (origin_x, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 3, cv2.LINE_AA)
         cv2.putText(compare, text, (origin_x, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (44, 44, 44), 1, cv2.LINE_AA)
 
-    cv2.imwrite(compare_path, compare)
+    _write_image_unicode(compare_path, compare)
 
 
 def _load_keyframe_3d_summary(keyframe_dir: str, out_dir: str, run_id: int) -> Optional[Dict[str, object]]:
@@ -716,11 +1503,6 @@ def _maybe_generate_keyframe_3d_bundle(
         print("[INFO] 3D keyframe analysis skipped (servepose python not found).")
         return existing
 
-    run_hybrik_script = os.path.join(os.path.dirname(__file__), "run_hybrik_image.py")
-    if not os.path.exists(run_hybrik_script):
-        print("[INFO] 3D keyframe analysis skipped (run_hybrik_image.py missing).")
-        return existing
-
     _ensure_dir(keyframe_dir)
     phase_payloads: Dict[str, object] = {}
 
@@ -737,7 +1519,8 @@ def _maybe_generate_keyframe_3d_bundle(
         try:
             cmd_hybrik = [
                 servepose_python,
-                run_hybrik_script,
+                os.path.abspath(__file__),
+                "__run_hybrik_image",
                 "--image",
                 image_path,
                 "--out_dir",
@@ -752,35 +1535,32 @@ def _maybe_generate_keyframe_3d_bundle(
             overlay_path = os.path.join(phase_dir, "mesh_overlay.png")
             compare_path = os.path.join(phase_dir, "mesh_overlay_compare.png")
 
-            metrics_3d, debug_3d = serve_score.analyze_trophy_pose_3d(json_path)
+            metrics_3d, _ = serve_score.analyze_trophy_pose_3d(json_path)
             phase_metrics_3d = serve_score.summarize_keyframe_pose_3d(
                 json_path,
                 phase=phase,
                 dominant_hand="right",
             )
+            phase_metrics_3d = {**metrics_3d, **phase_metrics_3d}
             overlay_img, overlay_debug = serve_score.render_hybrik_mesh_overlay(
                 image_or_path=image_path,
                 data_or_path=json_path,
                 mesh_obj_path=obj_path,
             )
-            cv2.imwrite(overlay_path, overlay_img)
+            _write_image_unicode(overlay_path, overlay_img)
             _save_compare_image(image_path, overlay_img, compare_path, lang)
 
             phase_payloads[phase] = {
                 "phase": phase,
                 "label": _phase_display_name(phase, lang),
                 "frame_num": phase_frame_nums.get(phase),
-                "angles_3d": metrics_3d,
                 "phase_metrics_3d": phase_metrics_3d,
-                "angles_debug": debug_3d,
-                "overlay_debug": overlay_debug,
                 "artifacts": {
                     "compare_png": os.path.abspath(compare_path),
-                    "overlay_png": os.path.abspath(overlay_path),
-                    "json_path": os.path.abspath(json_path),
-                    "mesh_obj_path": os.path.abspath(obj_path),
                 },
             }
+            _remove_path(hybrik_dir)
+            _remove_path(overlay_path)
         except Exception as exc:
             phase_payloads[phase] = {
                 "phase": phase,
@@ -1950,6 +2730,111 @@ def _render_compact_html(
     return html
 
 
+def _build_compact_3d_report_summary_en(
+    keyframe_3d: Optional[Dict[str, object]],
+    timing_metrics: Dict[str, float],
+) -> Dict[str, object]:
+    phases = (keyframe_3d or {}).get("phases") if isinstance(keyframe_3d, dict) else {}
+    if not isinstance(phases, dict):
+        phases = {}
+
+    trophy_payload = phases.get("trophy") if isinstance(phases.get("trophy"), dict) else {}
+    drop_payload = phases.get("racket_drop") if isinstance(phases.get("racket_drop"), dict) else {}
+    contact_payload = phases.get("contact") if isinstance(phases.get("contact"), dict) else {}
+
+    trophy_metrics = trophy_payload.get("phase_metrics_3d") if isinstance(trophy_payload.get("phase_metrics_3d"), dict) else {}
+    drop_metrics = drop_payload.get("phase_metrics_3d") if isinstance(drop_payload.get("phase_metrics_3d"), dict) else {}
+    contact_metrics = contact_payload.get("phase_metrics_3d") if isinstance(contact_payload.get("phase_metrics_3d"), dict) else {}
+
+    tp_knee = _safe_float(trophy_metrics.get("lead_knee_flexion_deg"))
+    tp_trunk = _safe_float(trophy_metrics.get("trunk_inclination_deg"))
+    impact_height_norm = _safe_float(contact_metrics.get("impact_height_norm"))
+    rlp_shoulder_er = _safe_float(drop_metrics.get("shoulder_external_rotation_proxy_deg"))
+    bi_shoulder_raise = _safe_float(contact_metrics.get("shoulder_raise_deg"))
+    bi_elbow_flex = _safe_float(contact_metrics.get("elbow_flexion_deg"))
+
+    knee_score, _ = serve_score._score_lit_plateau(tp_knee, LIT_KNEE_MEAN, LIT_KNEE_SD)
+    trunk_score, _ = serve_score._score_lit_plateau(tp_trunk, LIT_TRUNK_MEAN, LIT_TRUNK_SD)
+
+    def _fmt_angle(value: float) -> str:
+        return "n/a" if not np.isfinite(value) else f"{value:.1f} deg"
+
+    def _fmt_bh(value: float) -> str:
+        return "n/a" if not np.isfinite(value) else f"{value:.3f} BH"
+
+    def _fmt_time(value: float) -> str:
+        return "n/a" if not np.isfinite(value) else f"{value:.3f}s"
+
+    timing_specs = [
+        ("timing_toss_to_trophy", "Toss to Trophy Interval", "No unified reference", TIMING_RANGES["timing_toss_to_trophy"]),
+        ("timing_trophy_to_drop", "Trophy to Drop Interval", "About 0.19-0.20s", TIMING_RANGES["timing_trophy_to_drop"]),
+        ("timing_drop_to_contact", "Drop to Contact Interval", "About 0.12-0.13s", TIMING_RANGES["timing_drop_to_contact"]),
+    ]
+    timing_rows: List[Dict[str, object]] = []
+    timing_scores: List[float] = []
+    for key, display_name, reference_text, rng in timing_specs:
+        value = _safe_float(timing_metrics.get(key))
+        score = _score_centered_range(value, rng[0], rng[1], edge_score=80.0)
+        if np.isfinite(score):
+            timing_scores.append(score)
+        timing_rows.append(
+            {
+                "name": display_name,
+                "current_value": _fmt_time(value),
+                "reference": reference_text,
+            }
+        )
+
+    timing_score = float(np.mean(timing_scores)) if timing_scores else float("nan")
+    final_score = _weighted_score([(knee_score, 0.40), (trunk_score, 0.40), (timing_score, 0.20)])
+
+    core_rows = [
+        {"name": "Trophy Knee Flexion (TP)", "current_value": _fmt_angle(tp_knee), "reference": "64.5 +/- 9.7 deg"},
+        {"name": "Trophy Trunk Inclination (TP)", "current_value": _fmt_angle(tp_trunk), "reference": "25.0 +/- 7.1 deg"},
+        {"name": "Impact Height (Body-Height Normalized)", "current_value": _fmt_bh(impact_height_norm), "reference": "About 1.50 BH"},
+        {"name": "Racket-Drop Shoulder External Rotation (RLP)", "current_value": _fmt_angle(rlp_shoulder_er), "reference": "130.1 +/- 26.5 deg"},
+        {"name": "Impact Shoulder Raise (BI)", "current_value": _fmt_angle(bi_shoulder_raise), "reference": "110.7 +/- 16.9 deg"},
+        {"name": "Impact Elbow Flexion (BI)", "current_value": _fmt_angle(bi_elbow_flex), "reference": "30.1 +/- 15.9 deg"},
+    ]
+
+    score_rows = [
+        {"name": "Trophy Knee Flexion (TP)", "score": knee_score, "weight": 0.40},
+        {"name": "Trophy Trunk Inclination (TP)", "score": trunk_score, "weight": 0.40},
+        {"name": "Auxiliary Timing", "score": timing_score, "weight": 0.20},
+        {"name": "Impact Height (Normalized)", "score": float("nan"), "weight": 0.0},
+        {"name": "Technical Score", "score": final_score, "weight": 1.0},
+    ]
+    timing_rows.append(
+        {
+            "name": "Auxiliary Timing Total",
+            "current_value": "n/a" if not np.isfinite(timing_score) else f"{timing_score:.1f}",
+            "reference": "System computed",
+        }
+    )
+
+    return {
+        "final_score": final_score,
+        "coverage_ratio": 2.0 / 3.0,
+        "core_rows": core_rows,
+        "score_rows": score_rows,
+        "timing_rows": timing_rows,
+        "raw_values": {
+            "tp_knee_flexion_deg": tp_knee,
+            "tp_trunk_inclination_deg": tp_trunk,
+            "impact_height_norm": impact_height_norm,
+            "rlp_shoulder_external_rotation_deg": rlp_shoulder_er,
+            "bi_shoulder_raise_deg": bi_shoulder_raise,
+            "bi_elbow_flexion_deg": bi_elbow_flex,
+            "timing_toss_to_trophy": _safe_float(timing_metrics.get("timing_toss_to_trophy")),
+            "timing_trophy_to_drop": _safe_float(timing_metrics.get("timing_trophy_to_drop")),
+            "timing_drop_to_contact": _safe_float(timing_metrics.get("timing_drop_to_contact")),
+            "tp_knee_score": knee_score,
+            "tp_trunk_score": trunk_score,
+            "timing_score": timing_score,
+        },
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", required=True)
@@ -1959,16 +2844,16 @@ def main() -> None:
     )
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--pose_csv", default=None)
-    ap.add_argument("--pose_source", choices=["raw", "smooth", "compare_zero"], default="compare_zero",
+    ap.add_argument("--pose_source", choices=["smooth"], default="smooth",
                     help="Data source selection for report.")
-    ap.add_argument("--use_coords", choices=["raw", "smooth"], default="smooth",
-                    help="Legacy: used when pose_source=raw/smooth.")
+    ap.add_argument("--use_coords", choices=["smooth"], default="smooth",
+                    help="Smooth pose coordinates used for scoring.")
     ap.add_argument("--smooth_mode", choices=["zero_phase", "causal"], default="zero_phase",
-                    help="Smoothing mode used when generating compare_zero.")
+                    help="Smoothing mode used when generating the pose track.")
     ap.add_argument("--v_thr", type=float, default=0.6)
     ap.add_argument("--gap_max", type=int, default=3)
     ap.add_argument("--smooth_window", type=int, default=9)
-    ap.add_argument("--lang", choices=["zh", "en"], default="zh")
+    ap.add_argument("--lang", choices=["en"], default="en")
     ap.add_argument("--quantile_calib", choices=["on", "off"], default="off",
                     help="Enable per-serve quantile calibration for impact/timing.")
     ap.add_argument("--hand_mode", choices=["auto", "A", "B"], default="auto",
@@ -1979,52 +2864,38 @@ def main() -> None:
                     help="Neighbor frame radius used for 3D stability verification.")
     ap.add_argument("--verify_3d_device", default="auto",
                     help="Torch device for HybrIK verification, e.g. auto/cpu/cuda:0.")
+    ap.add_argument("--output_mode", choices=["compact", "full"], default="compact",
+                    help="compact=keep only report essentials; full=retain debug intermediates.")
 
     args = ap.parse_args()
 
     _ensure_dir(args.out_dir)
+    video_path, staged_video_path = _prepare_video_input(args.video)
 
-    cap = cv2.VideoCapture(args.video)
+    cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 60.0
     cap.release()
 
     pose_csv = args.pose_csv
-    pose_source_used = args.pose_source
-    use_coords = args.use_coords
+    generated_pose_csv = None
+    pose_source_used = "smooth"
+    use_coords = "smooth"
+    overlay_video_path = os.path.join(args.out_dir, "serve_overlay.mp4")
 
-    if args.pose_source == "compare_zero":
-        use_coords = "smooth"
-        if not pose_csv:
-            out_csv = os.path.join(args.out_dir, "pose_compare_zero.csv")
-            out_video = os.path.join(args.out_dir, "pose_compare_zero.mp4")
-            if not os.path.exists(out_csv):
-                _run_extract(
-                    args.video,
-                    args.model,
-                    out_csv,
-                    out_video,
-                    smooth_mode=args.smooth_mode,
-                    v_thr=args.v_thr,
-                    gap_max=args.gap_max,
-                    smooth_window=args.smooth_window,
-                )
-            pose_csv = out_csv
-    else:
-        use_coords = args.pose_source
-        if not pose_csv:
-            out_csv = os.path.join(args.out_dir, "pose_compare_fast.csv")
-            out_video = os.path.join(args.out_dir, "pose_compare_fast.mp4")
+    if not pose_csv:
+        generated_pose_csv = os.path.join(args.out_dir, "_pose_smooth.csv")
+        if not os.path.exists(generated_pose_csv) or not os.path.exists(overlay_video_path):
             _run_extract(
-                args.video,
+                video_path,
                 args.model,
-                out_csv,
-                out_video,
+                generated_pose_csv,
+                overlay_video_path,
                 smooth_mode=args.smooth_mode,
                 v_thr=args.v_thr,
                 gap_max=args.gap_max,
                 smooth_window=args.smooth_window,
             )
-            pose_csv = out_csv
+        pose_csv = generated_pose_csv
 
     df = pd.read_csv(pose_csv, encoding="utf-8-sig")
     result = serve_score.analyze_serve(
@@ -2055,8 +2926,6 @@ def main() -> None:
     legacy_subscores = result.get("legacy_subscores")
     legacy_final = result.get("legacy_final_score")
     phases = result["phases"]
-    signals = result["signals"]
-    ts_ms = result["ts_ms"]
 
     metrics_path = os.path.join(args.out_dir, "metrics.json")
     payload = {
@@ -2078,32 +2947,14 @@ def main() -> None:
         "hand_mode_guess": result.get("hand_mode_guess"),
         "quality_flags": result.get("quality_flags"),
     }
-    with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
 
     debug_path = os.path.join(args.out_dir, "score_debug.json")
-    with open(debug_path, "w", encoding="utf-8") as f:
-        json.dump(result.get("score_debug", {}), f, indent=2, ensure_ascii=False)
-
-    plots_dir = os.path.join(args.out_dir, "plots")
-    _ensure_dir(plots_dir)
-    ts_s = ts_ms / 1000.0 if len(ts_ms) else np.arange(len(signals["left_wrist_y"])) / 30.0
-
-    plots = {}
-    plot_specs = [
-        ("left_wrist_y", "Left Wrist Y", "left_wrist_y.png", "Y (norm)"),
-        ("right_wrist_y", "Right Wrist Y", "right_wrist_y.png", "Y (norm)"),
-        ("shoulder_tilt", "Shoulder Tilt (R - L)", "shoulder_tilt.png", "Y diff"),
-        ("knee_angle", "Knee Angle", "knee_angle.png", "Degrees"),
-        ("elbow_angle", "Elbow Angle", "elbow_angle.png", "Degrees"),
-    ]
-    for key, title, filename, ylabel in plot_specs:
-        out_path = os.path.join(plots_dir, filename)
-        _plot_series(ts_s, signals[key], title, ylabel, out_path, phases)
-        plots[key] = _posix_path(os.path.join("plots", filename))
+    if args.output_mode == "full":
+        with open(debug_path, "w", encoding="utf-8") as f:
+            json.dump(result.get("score_debug", {}), f, indent=2, ensure_ascii=False)
 
     run_id = int(time.time() * 1000)
-    keyframes = _save_keyframes(args.video, phases, args.out_dir)
+    _save_keyframes(video_path, phases, args.out_dir)
     phase_frame_nums = {
         phase_name: _phase_frame_num(phases, result.get("frames"), phase_name)
         for phase_name in KEYFRAME_3D_PHASES
@@ -2116,26 +2967,10 @@ def main() -> None:
         verify_3d=args.verify_3d,
         verify_device=args.verify_3d_device,
     )
-    report_3d_summary = _build_compact_3d_report_summary(keyframe_3d, metrics, args.lang)
+    report_3d_summary = _build_compact_3d_report_summary_en(keyframe_3d, metrics)
     display_final_score = _safe_float(report_3d_summary.get("final_score"))
     if not np.isfinite(display_final_score):
         display_final_score = float(final_score_legacy)
-    keyframes = {k: f"{v}?v={run_id}" for k, v in keyframes.items()}
-    diagnosis = _diagnosis_biomech(subscores, biomech, args.lang)
-    hand_meta = {
-        "hand_mode_selected": result.get("hand_mode_selected"),
-        "mirror_suspect": result.get("mirror_suspect"),
-        "hand_mode_guess": result.get("hand_mode_guess"),
-    }
-    source_meta = {
-        "pose_source_used": pose_source_used,
-        "fps": fps,
-        "v_thr": args.v_thr,
-        "gap_max": args.gap_max,
-        "smooth_window": args.smooth_window,
-        "smooth_mode": args.smooth_mode,
-        "quantile_calib": args.quantile_calib,
-    }
     html = _render_compact_html(
         args.out_dir,
         keyframe_3d=keyframe_3d,
@@ -2160,9 +2995,18 @@ def main() -> None:
     else:
         print("[INFO] PDF export skipped (optional dependency missing).")
 
+    if args.output_mode == "compact":
+        _cleanup_compact_outputs(args.out_dir, generated_pose_csv)
+
+    if staged_video_path:
+        _remove_path(staged_video_path)
+
     print(f"[OK] metrics.json: {metrics_path}")
     print(f"[OK] report.html : {html_path}")
-    print(f"[OK] score_debug.json: {debug_path}")
+    if os.path.exists(overlay_video_path):
+        print(f"[OK] overlay.mp4 : {overlay_video_path}")
+    if args.output_mode == "full" and os.path.exists(debug_path):
+        print(f"[OK] score_debug.json: {debug_path}")
     print("[INFO] pose_source_used:", pose_source_used)
     print("[INFO] fps:", fps)
     print("[INFO] v_thr:", args.v_thr, "gap_max:", args.gap_max, "smooth_window:", args.smooth_window,
@@ -2178,4 +3022,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "__extract_pose":
+        extract_pose_compare_main(sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "__run_hybrik_image":
+        run_hybrik_image_main(sys.argv[2:])
+    else:
+        main()
