@@ -293,6 +293,11 @@ def run_inference(
         "betas": pred_betas,
         "phi": pred_phi,
         "theta_mats": pred_theta,
+        # HybrIK camera model constants – used by serve_score.py to convert
+        # pred_xyz_29 (root-relative depth-factor units) to camera-space metres.
+        "depth_factor": float(getattr(hybrik_model, "depth_factor", 2.2)),
+        "hybrik_focal_length": float(getattr(hybrik_model, "focal_length", 1000.0)),
+        "hybrik_input_size": float(getattr(hybrik_model, "input_size", 256.0)),
         "joints_3d_17": pred_xyz_17,
         "joints_3d_24_struct": pred_xyz_24_struct,
         "joints_3d_29": [

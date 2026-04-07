@@ -1994,6 +1994,15 @@ def analyze_serve(
 # -----------------------------
 # HybrIK / 3D verification utils
 # -----------------------------
+
+# HybrIK camera model constants (derived from the standard HybrIK config).
+# pred_xyz_29 joints are stored in ROOT-RELATIVE depth-factor units; multiply
+# by HYBRIK_DEPTH_FACTOR to convert to absolute camera-space meters before
+# mixing with the translation vector (which is already in meters).
+HYBRIK_FOCAL_LENGTH: float = 1000.0    # pinhole focal length used during HybrIK training (px on 256-crop)
+HYBRIK_INPUT_SIZE: float = 256.0       # square crop size HybrIK expects
+HYBRIK_DEPTH_FACTOR: float = 2.2       # meters per depth-factor unit  (BBOX_3D_SHAPE[2] * 1e-3)
+
 HYBRIK_SKELETON_EDGES = [
     ("pelvis", "left_hip"),
     ("left_hip", "left_knee"),
@@ -2466,6 +2475,13 @@ def fit_hybrik_projection(data_or_path: Union[str, Dict[str, object]]) -> Dict[s
     rows_3d: List[np.ndarray] = []
     rows_2d: List[np.ndarray] = []
     transl = np.asarray(translation, dtype=float)
+    # pred_xyz_29 joints are stored in root-relative depth-factor units.
+    # Convert to absolute camera-space meters before mixing with transl (meters).
+    depth_factor = float(data.get("depth_factor", HYBRIK_DEPTH_FACTOR))
+    # Analytical focal expected from HybrIK's pinhole model on the squared bbox crop.
+    hybrik_fl = float(data.get("hybrik_focal_length", HYBRIK_FOCAL_LENGTH))
+    hybrik_is = float(data.get("hybrik_input_size", HYBRIK_INPUT_SIZE))
+    analytical_focal = hybrik_fl * bw / hybrik_is
 
     for item in extract_hybrik_joint_items(data):
         xyz = item.get("xyz")
@@ -2474,7 +2490,7 @@ def fit_hybrik_projection(data_or_path: Union[str, Dict[str, object]]) -> Dict[s
             continue
         if not isinstance(uvd, list) or len(uvd) != 3:
             continue
-        joint_3d = np.asarray(xyz, dtype=float) + transl
+        joint_3d = np.asarray(xyz, dtype=float) * depth_factor + transl
         joint_2d = np.array(
             [float(uvd[0]) * bw + cx0, float(uvd[1]) * bw + cy0],
             dtype=float,
@@ -2505,6 +2521,15 @@ def fit_hybrik_projection(data_or_path: Union[str, Dict[str, object]]) -> Dict[s
 
     solution, _, _, _ = np.linalg.lstsq(design, targets, rcond=None)
     focal_px, cx_px, cy_px = [float(v) for v in solution]
+
+    # Sanity-check: if the fitted focal differs by more than 3× from the
+    # analytical value (focal_length × bbox_width / input_size), the joint data
+    # is likely degenerate.  Fall back to the known-good analytical camera.
+    if not (analytical_focal / 3.0 <= focal_px <= analytical_focal * 3.0):
+        focal_px = analytical_focal
+        cx_px = cx0
+        cy_px = cy0
+
     fitted_2d = np.column_stack([focal_px * x_norm + cx_px, focal_px * y_norm + cy_px])
     errors = np.linalg.norm(fitted_2d - points_2d, axis=1)
 
@@ -2512,6 +2537,7 @@ def fit_hybrik_projection(data_or_path: Union[str, Dict[str, object]]) -> Dict[s
         "focal_px": focal_px,
         "cx_px": cx_px,
         "cy_px": cy_px,
+        "analytical_focal_px": analytical_focal,
         "num_joints": int(points_3d.shape[0]),
         "fit_mean_error_px": float(np.mean(errors)),
         "fit_max_error_px": float(np.max(errors)),
@@ -2594,6 +2620,8 @@ def build_pose_alignment_anchors(
     if not isinstance(translation, list) or len(translation) != 3:
         raise RuntimeError("Expected `translation` in HybrIK JSON.")
     transl = np.asarray(translation, dtype=float)
+    # pred_xyz_29 joints are root-relative in depth-factor units; convert to meters.
+    depth_factor = float(data.get("depth_factor", HYBRIK_DEPTH_FACTOR))
 
     bbox = data.get("bbox_xyxy")
     if not isinstance(bbox, list) or len(bbox) != 4:
@@ -2612,8 +2640,8 @@ def build_pose_alignment_anchors(
             continue
         if not isinstance(uvd, list) or len(uvd) != 3:
             continue
-        # camera-space 3D position
-        xyz_cam = np.asarray(xyz, dtype=float) + transl
+        # camera-space 3D position in meters
+        xyz_cam = np.asarray(xyz, dtype=float) * depth_factor + transl
         if not np.isfinite(xyz_cam).all() or xyz_cam[2] <= 1e-8:
             continue
         # project using fitted camera → src
