@@ -2518,6 +2518,122 @@ def fit_hybrik_projection(data_or_path: Union[str, Dict[str, object]]) -> Dict[s
     }
 
 
+def fit_similarity_2d(
+    src_pts: np.ndarray,
+    dst_pts: np.ndarray,
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    """Compute the optimal 2D similarity transform (uniform scale + rotation + translation)
+    that maps *src_pts* → *dst_pts* using the Umeyama algorithm.
+
+    Returns
+    -------
+    scale : float
+        Uniform scale factor.
+    R : (2, 2) ndarray
+        Rotation matrix.
+    t : (2,) ndarray
+        Translation vector.
+    The transform is applied as: dst ≈ scale * R @ src + t
+    """
+    src = np.asarray(src_pts, dtype=float)
+    dst = np.asarray(dst_pts, dtype=float)
+    if src.ndim != 2 or src.shape[1] != 2 or src.shape != dst.shape:
+        raise RuntimeError("fit_similarity_2d requires src and dst of shape (N, 2).")
+    if src.shape[0] < 2:
+        raise RuntimeError("fit_similarity_2d requires at least 2 point pairs.")
+
+    mu_src = src.mean(axis=0)
+    mu_dst = dst.mean(axis=0)
+    src_c = src - mu_src
+    dst_c = dst - mu_dst
+
+    var_src = float(np.mean(np.sum(src_c ** 2, axis=1)))
+    if var_src < 1e-12:
+        # degenerate source — fall back to pure translation
+        return 1.0, np.eye(2, dtype=float), mu_dst - mu_src
+
+    M = (dst_c.T @ src_c) / src.shape[0]
+    U, S, Vt = np.linalg.svd(M)
+
+    # correct for reflection so det(R) = +1
+    det_sign = 1.0 if np.linalg.det(U @ Vt) > 0 else -1.0
+    sign_correction = np.diag([1.0, det_sign])
+    R = U @ sign_correction @ Vt
+    scale = float(np.sum(S * np.diag(sign_correction)) / var_src)
+    t = mu_dst - scale * (R @ mu_src)
+    return scale, R, t
+
+
+def apply_similarity_2d(
+    pts: np.ndarray,
+    scale: float,
+    R: np.ndarray,
+    t: np.ndarray,
+) -> np.ndarray:
+    """Apply a 2D similarity transform to an (N, 2) array of points."""
+    pts = np.asarray(pts, dtype=float)
+    return scale * (pts @ R.T) + t[None, :]
+
+
+def build_pose_alignment_anchors(
+    data: Dict[str, object],
+    focal_px: float,
+    cx_px: float,
+    cy_px: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build matched (src, dst) 2D point arrays for pose-driven alignment.
+
+    *src_pts* are joint positions projected with the fitted pinhole camera.
+    *dst_pts* are the UVD-based 2D joint positions from HybrIK output.
+
+    These pairs are used to fit a 2D similarity transform that corrects any
+    residual camera-fitting error and maps the mesh exactly onto the predicted
+    joint locations in the image.
+    """
+    translation = data.get("translation")
+    if not isinstance(translation, list) or len(translation) != 3:
+        raise RuntimeError("Expected `translation` in HybrIK JSON.")
+    transl = np.asarray(translation, dtype=float)
+
+    bbox = data.get("bbox_xyxy")
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        raise RuntimeError("Expected `bbox_xyxy` in HybrIK JSON.")
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    bbox_cx = (x1 + x2) / 2.0
+    bw = x2 - x1
+
+    src_list: List[np.ndarray] = []
+    dst_list: List[np.ndarray] = []
+
+    for item in extract_hybrik_joint_items(data):
+        xyz = item.get("xyz")
+        uvd = item.get("uvd")
+        if not isinstance(xyz, list) or len(xyz) != 3:
+            continue
+        if not isinstance(uvd, list) or len(uvd) != 3:
+            continue
+        # camera-space 3D position
+        xyz_cam = np.asarray(xyz, dtype=float) + transl
+        if not np.isfinite(xyz_cam).all() or xyz_cam[2] <= 1e-8:
+            continue
+        # project using fitted camera → src
+        sx = focal_px * (xyz_cam[0] / xyz_cam[2]) + cx_px
+        sy = focal_px * (xyz_cam[1] / xyz_cam[2]) + cy_px
+        # UVD → image pixel → dst
+        dx = float(uvd[0]) * bw + bbox_cx
+        dy = float(uvd[1]) * bw + (y1 + y2) / 2.0
+        if not all(map(np.isfinite, [sx, sy, dx, dy])):
+            continue
+        src_list.append(np.array([sx, sy], dtype=float))
+        dst_list.append(np.array([dx, dy], dtype=float))
+
+    if len(src_list) < 4:
+        raise RuntimeError(
+            f"Not enough valid anchor joints for pose alignment (got {len(src_list)}, need ≥4)."
+        )
+    return np.stack(src_list, axis=0), np.stack(dst_list, axis=0)
+
+
 def project_points_pinhole(
     points_3d: np.ndarray,
     focal_px: float,
@@ -2549,13 +2665,28 @@ def render_projected_mesh_overlay(
     outline_color_bgr: Tuple[int, int, int] = (154, 136, 113),
     target_bbox_xyxy: Optional[Iterable[float]] = None,
     target_fill_ratio: float = 0.98,
+    alignment_anchors: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
+    """Render the SMPL mesh as a semi-transparent overlay on *image_bgr*.
+
+    Alignment strategy (applied in priority order):
+    1. **Pose-driven** (preferred): when *alignment_anchors* = (src_pts, dst_pts)
+       is provided, fit a 2D similarity transform (scale + rotation + translation)
+       from the camera-projected joint positions (src) to the UVD joint positions
+       (dst) and apply it to all vertex projections.  This achieves a 1:1
+       alignment with the person in the photo.
+    2. **Bbox-based fallback**: when *target_bbox_xyxy* is provided but no
+       anchors, rescale the mesh bounding box to fit inside the detector bbox.
+    3. **Raw projection**: if neither is provided, use the raw pinhole projection
+       without any 2D post-correction.
+    """
     if image_bgr is None or image_bgr.size == 0:
         raise RuntimeError("Expected a valid BGR image for mesh overlay rendering.")
 
     image_h, image_w = image_bgr.shape[:2]
     verts_2d, valid_vertices = project_points_pinhole(vertices_3d, focal_px, cx_px, cy_px)
     transform_debug: Dict[str, object] = {
+        "alignment_mode": "none",
         "target_bbox_xyxy": None,
         "target_fill_ratio": float(target_fill_ratio),
         "overlay_scale": 1.0,
@@ -2563,7 +2694,33 @@ def render_projected_mesh_overlay(
     }
 
     valid_points = verts_2d[valid_vertices]
-    if target_bbox_xyxy is not None and valid_points.size:
+
+    # --- Priority 1: pose-driven similarity transform ---
+    if alignment_anchors is not None and valid_points.size:
+        src_pts, dst_pts = alignment_anchors
+        try:
+            sim_scale, sim_R, sim_t = fit_similarity_2d(src_pts, dst_pts)
+            verts_2d = apply_similarity_2d(verts_2d, sim_scale, sim_R, sim_t)
+            # recompute anchor fit residual for diagnostics
+            src_aligned = apply_similarity_2d(src_pts, sim_scale, sim_R, sim_t)
+            anchor_errors = np.linalg.norm(src_aligned - dst_pts, axis=1)
+            transform_debug = {
+                "alignment_mode": "pose_driven_similarity",
+                "target_bbox_xyxy": None,
+                "target_fill_ratio": float(target_fill_ratio),
+                "overlay_scale": float(sim_scale),
+                "overlay_shift_xy": sim_t.tolist(),
+                "sim_rotation_deg": float(np.degrees(np.arctan2(sim_R[1, 0], sim_R[0, 0]))),
+                "anchor_mean_error_px": float(np.mean(anchor_errors)),
+                "anchor_max_error_px": float(np.max(anchor_errors)),
+                "num_anchor_pairs": int(src_pts.shape[0]),
+            }
+        except (RuntimeError, ValueError, np.linalg.LinAlgError) as _align_err:
+            # fall through to bbox-based alignment if similarity fitting fails
+            transform_debug["alignment_fallback_reason"] = str(_align_err)
+
+    # --- Priority 2: bbox-based scale + center (legacy fallback) ---
+    if transform_debug.get("alignment_mode") == "none" and target_bbox_xyxy is not None and valid_points.size:
         tx1, ty1, tx2, ty2 = [float(v) for v in target_bbox_xyxy]
         mesh_min = valid_points.min(axis=0)
         mesh_max = valid_points.max(axis=0)
@@ -2574,6 +2731,7 @@ def render_projected_mesh_overlay(
         scale = float(min(target_size[0] / mesh_size[0], target_size[1] / mesh_size[1]) * target_fill_ratio)
         verts_2d = (verts_2d - mesh_center[None, :]) * scale + target_center[None, :]
         transform_debug = {
+            "alignment_mode": "bbox_scale_center",
             "target_bbox_xyxy": [tx1, ty1, tx2, ty2],
             "target_fill_ratio": float(target_fill_ratio),
             "overlay_scale": scale,
@@ -2658,7 +2816,17 @@ def render_hybrik_mesh_overlay(
     base_color_bgr: Tuple[int, int, int] = (222, 206, 184),
     outline_color_bgr: Tuple[int, int, int] = (154, 136, 113),
     fit_to_detector_bbox: bool = True,
+    use_pose_alignment: bool = True,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
+    """Render the SMPL mesh over the input image with adaptive 1:1 alignment.
+
+    When *use_pose_alignment* is True (the default), a 2D similarity transform
+    is fitted from camera-projected joint positions to the UVD joint positions
+    predicted by HybrIK.  This makes the mesh overlay precisely match the pose
+    visible in the photograph.  If alignment anchor fitting fails, the method
+    falls back to detector-bbox-based scaling when *fit_to_detector_bbox* is
+    True, and then to the raw projection.
+    """
     if isinstance(image_or_path, str):
         image_bgr = cv2.imread(image_or_path)
         if image_bgr is None:
@@ -2683,11 +2851,28 @@ def render_hybrik_mesh_overlay(
 
     vertices, faces = load_obj_mesh(mesh_obj_path)
     vertices_cam = vertices + np.asarray(translation, dtype=float)[None, :]
+
+    # Build pose-driven alignment anchors (src = camera-projected joints,
+    # dst = UVD joint positions predicted by HybrIK).
+    alignment_anchors: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    if use_pose_alignment:
+        try:
+            alignment_anchors = build_pose_alignment_anchors(
+                data,
+                focal_px=projection["focal_px"],
+                cx_px=projection["cx_px"],
+                cy_px=projection["cy_px"],
+            )
+        except (RuntimeError, ValueError, np.linalg.LinAlgError):
+            alignment_anchors = None
+
+    # Detector bbox is used as a fallback when pose alignment is unavailable.
     target_bbox = None
-    if fit_to_detector_bbox:
+    if fit_to_detector_bbox and alignment_anchors is None:
         bbox = data.get("detector_bbox_xyxy")
         if isinstance(bbox, list) and len(bbox) == 4:
             target_bbox = bbox
+
     overlay_bgr, render_debug = render_projected_mesh_overlay(
         image_bgr=image_bgr,
         vertices_3d=vertices_cam,
@@ -2699,17 +2884,20 @@ def render_hybrik_mesh_overlay(
         base_color_bgr=base_color_bgr,
         outline_color_bgr=outline_color_bgr,
         target_bbox_xyxy=target_bbox,
+        alignment_anchors=alignment_anchors,
     )
     debug = {
         "image_path": image_path,
         "mesh_obj_path": os.path.abspath(mesh_obj_path),
         "projection": projection,
         "fit_to_detector_bbox": bool(fit_to_detector_bbox),
+        "use_pose_alignment": bool(use_pose_alignment),
         "vertices_count": int(vertices.shape[0]),
         "faces_count": int(faces.shape[0]),
         **render_debug,
     }
     return overlay_bgr, debug
+
 
 
 def load_pose_frame_points(
