@@ -2634,6 +2634,112 @@ def build_pose_alignment_anchors(
     return np.stack(src_list, axis=0), np.stack(dst_list, axis=0)
 
 
+# ---------------------------------------------------------------------------
+# Rendering constants – lighting model for render_projected_mesh_overlay
+# ---------------------------------------------------------------------------
+
+# Key light: above-front-right in camera space (normalised)
+_RENDER_LIGHT_KEY: np.ndarray = np.array([0.30, -0.60, 0.75], dtype=float)
+_RENDER_LIGHT_KEY = _RENDER_LIGHT_KEY / np.linalg.norm(_RENDER_LIGHT_KEY)
+
+# Fill light: below-left-front (normalised)
+_RENDER_LIGHT_FILL: np.ndarray = np.array([-0.50, 0.20, 0.60], dtype=float)
+_RENDER_LIGHT_FILL = _RENDER_LIGHT_FILL / np.linalg.norm(_RENDER_LIGHT_FILL)
+
+# Phong lighting coefficients: ambient + key-diffuse + fill-diffuse + specular
+_RENDER_K_AMBIENT: float = 0.28     # constant base illumination on all surfaces
+_RENDER_K_DIFFUSE_KEY: float = 0.52  # Lambertian key-light contribution
+_RENDER_K_DIFFUSE_FILL: float = 0.18  # Lambertian fill-light contribution
+_RENDER_K_SPECULAR: float = 0.07    # Phong specular highlight strength
+_RENDER_SHININESS: float = 24.0     # Phong shininess exponent
+
+# Feathering: Gaussian-blur kernel = this fraction of the shorter image edge
+_RENDER_FEATHER_RATIO: float = 0.007
+
+# Rim-light highlight: how many DN to add to outline_color_bgr for the inner
+# 1 px stroke that creates a crisp, back-lit edge feel
+_RENDER_RIM_HIGHLIGHT_OFFSET: int = 55
+
+# Photo-texture default blend weight (fraction of sampled image colour)
+_RENDER_DEFAULT_PHOTO_BLEND: float = 0.35
+
+
+def _compute_vertex_normals(
+    vertices_3d: np.ndarray,
+    faces: np.ndarray,
+) -> np.ndarray:
+    """Compute smooth per-vertex normals via area-weighted averaging of adjacent face normals.
+
+    Uses numpy scatter-add so it is fully vectorised.  The returned normals
+    are unit-length; degenerate vertices get [0, 0, 1].
+
+    Parameters
+    ----------
+    vertices_3d : (N, 3) ndarray  –  vertex positions in camera space
+    faces       : (M, 3) int ndarray  –  triangular face indices (0-based)
+
+    Returns
+    -------
+    (N, 3) ndarray of unit normals
+    """
+    verts = np.asarray(vertices_3d, dtype=float)
+    f = np.asarray(faces, dtype=np.int32)
+    v_normals = np.zeros_like(verts)
+    # face edge vectors; cross product magnitude = 2 * triangle area → area-weighted
+    e1 = verts[f[:, 1]] - verts[f[:, 0]]
+    e2 = verts[f[:, 2]] - verts[f[:, 0]]
+    face_normals = np.cross(e1, e2)  # (M, 3)
+    # scatter-accumulate into per-vertex normal buffer
+    np.add.at(v_normals, f[:, 0], face_normals)
+    np.add.at(v_normals, f[:, 1], face_normals)
+    np.add.at(v_normals, f[:, 2], face_normals)
+    norms = np.linalg.norm(v_normals, axis=1, keepdims=True)
+    norms = np.where(norms < 1e-12, 1.0, norms)
+    return v_normals / norms
+
+
+def _sample_image_colors_at_verts(
+    image_bgr: np.ndarray,
+    verts_2d: np.ndarray,
+    valid_vertices: np.ndarray,
+) -> np.ndarray:
+    """Bilinearly sample the BGR image at each projected vertex location.
+
+    Parameters
+    ----------
+    image_bgr      : (H, W, 3) uint8
+    verts_2d       : (N, 2) float  –  projected 2-D positions (x, y in pixels)
+    valid_vertices : (N,) bool     –  which vertices have a valid projection
+
+    Returns
+    -------
+    (N, 3) float array of sampled BGR colors; vertices outside the image or
+    with invalid projections get the zero vector.
+    """
+    h, w = image_bgr.shape[:2]
+    colors = np.zeros((len(verts_2d), 3), dtype=float)
+    valid = valid_vertices & np.isfinite(verts_2d).all(axis=1)
+    if not np.any(valid):
+        return colors
+    px = verts_2d[valid, 0]
+    py = verts_2d[valid, 1]
+    # bilinear weight components
+    x0 = np.clip(np.floor(px).astype(np.int32), 0, w - 1)
+    y0 = np.clip(np.floor(py).astype(np.int32), 0, h - 1)
+    x1 = np.clip(x0 + 1, 0, w - 1)
+    y1 = np.clip(y0 + 1, 0, h - 1)
+    dx = np.clip(px - np.floor(px), 0.0, 1.0)[:, None]
+    dy = np.clip(py - np.floor(py), 0.0, 1.0)[:, None]
+    c = (
+        image_bgr[y0, x0].astype(float) * (1.0 - dx) * (1.0 - dy)
+        + image_bgr[y0, x1].astype(float) * dx * (1.0 - dy)
+        + image_bgr[y1, x0].astype(float) * (1.0 - dx) * dy
+        + image_bgr[y1, x1].astype(float) * dx * dy
+    )
+    colors[valid] = c
+    return colors
+
+
 def project_points_pinhole(
     points_3d: np.ndarray,
     focal_px: float,
@@ -2666,6 +2772,7 @@ def render_projected_mesh_overlay(
     target_bbox_xyxy: Optional[Iterable[float]] = None,
     target_fill_ratio: float = 0.98,
     alignment_anchors: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    photo_blend_ratio: float = _RENDER_DEFAULT_PHOTO_BLEND,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
     """Render the SMPL mesh as a semi-transparent overlay on *image_bgr*.
 
@@ -2755,24 +2862,72 @@ def render_projected_mesh_overlay(
 
     tri_3d = vertices_3d[faces_arr]
     tri_2d = verts_2d[faces_arr]
-    normals = np.cross(tri_3d[:, 1] - tri_3d[:, 0], tri_3d[:, 2] - tri_3d[:, 0])
-    normal_mag = np.linalg.norm(normals, axis=1)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        facing = np.abs(normals[:, 2]) / normal_mag
-    facing = np.where(np.isfinite(facing), facing, 0.0)
-    depths = np.mean(tri_3d[:, :, 2], axis=1)
+
+    # Projected 2-D area (painter-visible) and mean depth for depth-sort
     areas = 0.5 * np.abs(
         tri_2d[:, 0, 0] * (tri_2d[:, 1, 1] - tri_2d[:, 2, 1])
         + tri_2d[:, 1, 0] * (tri_2d[:, 2, 1] - tri_2d[:, 0, 1])
         + tri_2d[:, 2, 0] * (tri_2d[:, 0, 1] - tri_2d[:, 1, 1])
     )
+    depths = np.mean(tri_3d[:, :, 2], axis=1)
     valid_faces &= np.isfinite(depths) & np.isfinite(areas) & (areas > 0.5)
 
-    canvas = np.zeros_like(image_bgr)
-    mask = np.zeros((image_h, image_w), dtype=np.uint8)
-    draw_order = np.argsort(depths[valid_faces])[::-1]
-    face_indices = np.flatnonzero(valid_faces)[draw_order]
+    # ------------------------------------------------------------------ #
+    # Smooth Phong shading (vectorised, computed once for all faces)       #
+    # ------------------------------------------------------------------ #
+    # Per-vertex normals via area-weighted average of adjacent face normals
+    v_normals = _compute_vertex_normals(vertices_3d, faces_arr)
+
+    # Average vertex normals per face → smooth (Gouraud-like) shading normal
+    fv0, fv1, fv2 = faces_arr[:, 0], faces_arr[:, 1], faces_arr[:, 2]
+    fn_raw = (v_normals[fv0] + v_normals[fv1] + v_normals[fv2]) / 3.0   # (M, 3)
+    fn_norm = np.linalg.norm(fn_raw, axis=1, keepdims=True)
+    fn_norm = np.where(fn_norm < 1e-12, 1.0, fn_norm)
+    fn = fn_raw / fn_norm                                                  # (M, 3) unit normals
+
+    # Two directional lights in camera space (module-level normalised constants)
+    K_AMB    = _RENDER_K_AMBIENT
+    K_DIFF_K = _RENDER_K_DIFFUSE_KEY
+    K_DIFF_F = _RENDER_K_DIFFUSE_FILL
+    K_SPEC   = _RENDER_K_SPECULAR
+    SHINY    = _RENDER_SHININESS
+
+    diff_key  = np.maximum(0.0, fn @ _RENDER_LIGHT_KEY)   # (M,)
+    diff_fill = np.maximum(0.0, fn @ _RENDER_LIGHT_FILL)  # (M,)
+    # Phong specular: view direction is (0, 0, -1) in camera space
+    dot_nk   = (fn * _RENDER_LIGHT_KEY[None, :]).sum(axis=1)     # (M,)
+    refl_kz  = 2.0 * dot_nk * fn[:, 2] - _RENDER_LIGHT_KEY[2]   # z-component of reflected key light
+    spec     = np.maximum(0.0, -refl_kz) ** SHINY  # dot(refl, [0,0,-1]) = -refl_z
+
+    intensities = np.clip(
+        K_AMB + K_DIFF_K * diff_key + K_DIFF_F * diff_fill + K_SPEC * spec,
+        0.0, 1.0,
+    )                                                # (M,)
+
+    # ------------------------------------------------------------------ #
+    # Image-colour sampling (bilinear) – blended into mesh colour for     #
+    # photo-textured "1:1 overlay" appearance                             #
+    # ------------------------------------------------------------------ #
+    vert_img_colors = _sample_image_colors_at_verts(image_bgr, verts_2d, valid_vertices)
+    # Per-face image colour = average of 3 vertex samples
+    face_img_colors = (vert_img_colors[fv0] + vert_img_colors[fv1] + vert_img_colors[fv2]) / 3.0
+
     base_color = np.asarray(base_color_bgr, dtype=float)
+    # lit mesh colour + photo_blend_ratio of sampled image colour
+    face_mesh_lit = base_color[None, :] * intensities[:, None]                                    # (M, 3)
+    face_fill_rgb = np.clip(
+        (1.0 - photo_blend_ratio) * face_mesh_lit + photo_blend_ratio * face_img_colors,
+        0.0, 255.0,
+    )
+    face_fill_u8  = face_fill_rgb.astype(np.uint8)                                                # (M, 3)
+
+    # ------------------------------------------------------------------ #
+    # Painter's-algorithm draw (back-to-front depth sort)                 #
+    # ------------------------------------------------------------------ #
+    canvas = np.zeros_like(image_bgr)
+    mask   = np.zeros((image_h, image_w), dtype=np.uint8)
+    draw_order  = np.argsort(depths[valid_faces])[::-1]
+    face_indices = np.flatnonzero(valid_faces)[draw_order]
 
     for face_idx in face_indices:
         tri = tri_2d[face_idx]
@@ -2783,21 +2938,37 @@ def render_projected_mesh_overlay(
             continue
         if np.all(tri_int[:, 1] < 0) or np.all(tri_int[:, 1] >= image_h):
             continue
-        intensity = 0.55 + 0.35 * float(facing[face_idx])
-        color = np.clip(base_color * intensity, 0, 255).astype(np.uint8).tolist()
+        color = face_fill_u8[face_idx].tolist()
         cv2.fillConvexPoly(canvas, tri_int, color, lineType=cv2.LINE_AA)
-        cv2.fillConvexPoly(mask, tri_int, 255, lineType=cv2.LINE_AA)
+        cv2.fillConvexPoly(mask,   tri_int, 255,   lineType=cv2.LINE_AA)
 
     if int(mask.sum()) == 0:
         raise RuntimeError("Mesh projection produced an empty overlay mask.")
 
-    alpha_mask = (mask.astype(np.float32) / 255.0)[:, :, None] * float(np.clip(alpha, 0.0, 1.0))
-    blended = image_bgr.astype(np.float32) * (1.0 - alpha_mask) + canvas.astype(np.float32) * alpha_mask
-    blended = np.clip(blended, 0, 255).astype(np.uint8)
+    # ------------------------------------------------------------------ #
+    # Feathered alpha compositing – soft edge instead of hard binary mask  #
+    # ------------------------------------------------------------------ #
+    # Kernel size ≈ _RENDER_FEATHER_RATIO of the shorter image dimension, always odd ≥ 3
+    feather_ks = max(3, int(min(image_w, image_h) * _RENDER_FEATHER_RATIO))
+    if feather_ks % 2 == 0:
+        feather_ks += 1
+    mask_float  = cv2.GaussianBlur(mask.astype(np.float32) / 255.0,
+                                   (feather_ks, feather_ks), 0)
+    alpha_val   = float(np.clip(alpha, 0.0, 1.0))
+    alpha_map   = mask_float[:, :, None] * alpha_val
+    blended     = image_bgr.astype(np.float32) * (1.0 - alpha_map) + canvas.astype(np.float32) * alpha_map
+    blended     = np.clip(blended, 0, 255).astype(np.uint8)
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # ------------------------------------------------------------------ #
+    # Silhouette edges: 2 px outline + 1 px inner highlight               #
+    # ------------------------------------------------------------------ #
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if contours:
-        cv2.drawContours(blended, contours, -1, outline_color_bgr, 1, lineType=cv2.LINE_AA)
+        # outer 2 px stroke with the requested outline colour
+        cv2.drawContours(blended, contours, -1, outline_color_bgr, 2, lineType=cv2.LINE_AA)
+        # inner 1 px lighter highlight for a crisp rim-light feel (_RENDER_RIM_HIGHLIGHT_OFFSET DN)
+        highlight = tuple(int(min(255, c + _RENDER_RIM_HIGHLIGHT_OFFSET)) for c in outline_color_bgr)
+        cv2.drawContours(blended, contours, -1, highlight, 1, lineType=cv2.LINE_AA)
 
     return blended, {
         "mask_area_px": int(np.count_nonzero(mask)),
