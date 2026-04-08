@@ -18,6 +18,15 @@ Serve AI Tracker is a tennis serve analysis project with two runtime paths:
 
 The repository is intentionally split this way because the 2D flow is cheap enough for hosted demos, while the 3D flow depends on a heavier local environment with PyTorch and HybrIK assets.
 
+This repository mixes:
+
+- original project code for serve analysis and reporting
+- third-party code vendored under `third_party/`
+- downloadable third-party model files
+- local assets that should not automatically be treated as redistributable
+
+If you plan to publish or redistribute the repository, read [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) and [PRIVACY_AND_COMPLIANCE.md](./PRIVACY_AND_COMPLIANCE.md) first.
+
 ## Demo
 
 ![Serve AI Tracker demo](./assets/serve-tracker-demo.gif)
@@ -37,6 +46,7 @@ The demo above shows the current smooth-pose tracking overlay produced by the lo
 - [README.md](./README.md): public project overview
 - [LOCAL_3D_ASSETS.md](./LOCAL_3D_ASSETS.md): practical local 3D asset setup
 - [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md): third-party code and model asset licensing notes
+- [PRIVACY_AND_COMPLIANCE.md](./PRIVACY_AND_COMPLIANCE.md): publication and redistribution guardrails
 - [CONTRIBUTING.md](./CONTRIBUTING.md): contribution guidelines
 
 ## What The Project Does
@@ -64,6 +74,7 @@ serve_score.py          Core 2D serve scoring logic
 make_report.py          Main local pipeline: extraction, 3D helpers, report export
 extract_pose_compare.py Compatibility wrapper to the extraction subcommand in make_report.py
 run_hybrik_image.py     Compatibility wrapper to the HybrIK subcommand in make_report.py
+download_model.py       MediaPipe pose model download helper
 models/                 MediaPipe model assets
 third_party/HybrIK-main HybrIK checkout and local resources
 ```
@@ -90,7 +101,13 @@ conda activate servepose
 pip install -r requirements-local-3d.txt
 ```
 
-You will also need local model assets. See [LOCAL_3D_ASSETS.md](./LOCAL_3D_ASSETS.md).
+If `models/pose_landmarker_full.task` is missing, download it with:
+
+```bash
+python download_model.py
+```
+
+You will also need local 3D model assets. See [LOCAL_3D_ASSETS.md](./LOCAL_3D_ASSETS.md).
 
 ## Running The Project
 
@@ -152,6 +169,7 @@ As of April 2, 2026, the public 2D dependency pins were refreshed to newer PyPI 
 - the original repository code is now released under the root [MIT License](./LICENSE)
 - the 3D stack includes third-party code and model assets that are not all covered by the same terms
 - if you plan to publish, fork, redistribute, or commercialize the 3D path, read [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) first
+- public releases should also be checked against [PRIVACY_AND_COMPLIANCE.md](./PRIVACY_AND_COMPLIANCE.md)
 
 ## Repository License Status
 

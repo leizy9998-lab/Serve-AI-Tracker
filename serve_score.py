@@ -2694,6 +2694,228 @@ def fit_hybrik_projection(data_or_path: Union[str, Dict[str, object]]) -> Dict[s
     }
 
 
+def fit_similarity_2d(
+    src_pts: np.ndarray,
+    dst_pts: np.ndarray,
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    """Compute the optimal 2D similarity transform (uniform scale + rotation + translation)
+    that maps *src_pts* → *dst_pts* using the Umeyama algorithm.
+
+    Returns
+    -------
+    scale : float
+        Uniform scale factor.
+    R : (2, 2) ndarray
+        Rotation matrix.
+    t : (2,) ndarray
+        Translation vector.
+    The transform is applied as: dst ≈ scale * R @ src + t
+    """
+    src = np.asarray(src_pts, dtype=float)
+    dst = np.asarray(dst_pts, dtype=float)
+    if src.ndim != 2 or src.shape[1] != 2 or src.shape != dst.shape:
+        raise RuntimeError("fit_similarity_2d requires src and dst of shape (N, 2).")
+    if src.shape[0] < 2:
+        raise RuntimeError("fit_similarity_2d requires at least 2 point pairs.")
+
+    mu_src = src.mean(axis=0)
+    mu_dst = dst.mean(axis=0)
+    src_c = src - mu_src
+    dst_c = dst - mu_dst
+
+    var_src = float(np.mean(np.sum(src_c ** 2, axis=1)))
+    if var_src < 1e-12:
+        # degenerate source — fall back to pure translation
+        return 1.0, np.eye(2, dtype=float), mu_dst - mu_src
+
+    M = (dst_c.T @ src_c) / src.shape[0]
+    U, S, Vt = np.linalg.svd(M)
+
+    # correct for reflection so det(R) = +1
+    det_sign = 1.0 if np.linalg.det(U @ Vt) > 0 else -1.0
+    sign_correction = np.diag([1.0, det_sign])
+    R = U @ sign_correction @ Vt
+    scale = float(np.sum(S * np.diag(sign_correction)) / var_src)
+    t = mu_dst - scale * (R @ mu_src)
+    return scale, R, t
+
+
+def apply_similarity_2d(
+    pts: np.ndarray,
+    scale: float,
+    R: np.ndarray,
+    t: np.ndarray,
+) -> np.ndarray:
+    """Apply a 2D similarity transform to an (N, 2) array of points."""
+    pts = np.asarray(pts, dtype=float)
+    return scale * (pts @ R.T) + t[None, :]
+
+
+def build_pose_alignment_anchors(
+    data: Dict[str, object],
+    focal_px: float,
+    cx_px: float,
+    cy_px: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build matched (src, dst) 2D point arrays for pose-driven alignment.
+
+    *src_pts* are joint positions projected with the fitted pinhole camera.
+    *dst_pts* are the UVD-based 2D joint positions from HybrIK output.
+
+    These pairs are used to fit a 2D similarity transform that corrects any
+    residual camera-fitting error and maps the mesh exactly onto the predicted
+    joint locations in the image.
+    """
+    translation = data.get("translation")
+    if not isinstance(translation, list) or len(translation) != 3:
+        raise RuntimeError("Expected `translation` in HybrIK JSON.")
+    transl = np.asarray(translation, dtype=float)
+
+    bbox = data.get("bbox_xyxy")
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        raise RuntimeError("Expected `bbox_xyxy` in HybrIK JSON.")
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    bbox_cx = (x1 + x2) / 2.0
+    bw = x2 - x1
+
+    src_list: List[np.ndarray] = []
+    dst_list: List[np.ndarray] = []
+
+    for item in extract_hybrik_joint_items(data):
+        xyz = item.get("xyz")
+        uvd = item.get("uvd")
+        if not isinstance(xyz, list) or len(xyz) != 3:
+            continue
+        if not isinstance(uvd, list) or len(uvd) != 3:
+            continue
+        # camera-space 3D position
+        xyz_cam = np.asarray(xyz, dtype=float) + transl
+        if not np.isfinite(xyz_cam).all() or xyz_cam[2] <= 1e-8:
+            continue
+        # project using fitted camera → src
+        sx = focal_px * (xyz_cam[0] / xyz_cam[2]) + cx_px
+        sy = focal_px * (xyz_cam[1] / xyz_cam[2]) + cy_px
+        # UVD → image pixel → dst
+        dx = float(uvd[0]) * bw + bbox_cx
+        dy = float(uvd[1]) * bw + (y1 + y2) / 2.0
+        if not all(map(np.isfinite, [sx, sy, dx, dy])):
+            continue
+        src_list.append(np.array([sx, sy], dtype=float))
+        dst_list.append(np.array([dx, dy], dtype=float))
+
+    if len(src_list) < 4:
+        raise RuntimeError(
+            f"Not enough valid anchor joints for pose alignment (got {len(src_list)}, need ≥4)."
+        )
+    return np.stack(src_list, axis=0), np.stack(dst_list, axis=0)
+
+
+# ---------------------------------------------------------------------------
+# Rendering constants – lighting model for render_projected_mesh_overlay
+# ---------------------------------------------------------------------------
+
+# Key light: above-front-right in camera space (normalised)
+_RENDER_LIGHT_KEY: np.ndarray = np.array([0.30, -0.60, 0.75], dtype=float)
+_RENDER_LIGHT_KEY = _RENDER_LIGHT_KEY / np.linalg.norm(_RENDER_LIGHT_KEY)
+
+# Fill light: below-left-front (normalised)
+_RENDER_LIGHT_FILL: np.ndarray = np.array([-0.50, 0.20, 0.60], dtype=float)
+_RENDER_LIGHT_FILL = _RENDER_LIGHT_FILL / np.linalg.norm(_RENDER_LIGHT_FILL)
+
+# Phong lighting coefficients: ambient + key-diffuse + fill-diffuse + specular
+_RENDER_K_AMBIENT: float = 0.28     # constant base illumination on all surfaces
+_RENDER_K_DIFFUSE_KEY: float = 0.52  # Lambertian key-light contribution
+_RENDER_K_DIFFUSE_FILL: float = 0.18  # Lambertian fill-light contribution
+_RENDER_K_SPECULAR: float = 0.07    # Phong specular highlight strength
+_RENDER_SHININESS: float = 24.0     # Phong shininess exponent
+
+# Feathering: Gaussian-blur kernel = this fraction of the shorter image edge
+_RENDER_FEATHER_RATIO: float = 0.007
+
+# Rim-light highlight: how many DN to add to outline_color_bgr for the inner
+# 1 px stroke that creates a crisp, back-lit edge feel
+_RENDER_RIM_HIGHLIGHT_OFFSET: int = 55
+
+# Photo-texture default blend weight (fraction of sampled image colour)
+_RENDER_DEFAULT_PHOTO_BLEND: float = 0.35
+
+
+def _compute_vertex_normals(
+    vertices_3d: np.ndarray,
+    faces: np.ndarray,
+) -> np.ndarray:
+    """Compute smooth per-vertex normals via area-weighted averaging of adjacent face normals.
+
+    Uses numpy scatter-add so it is fully vectorised.  The returned normals
+    are unit-length; degenerate vertices get [0, 0, 1].
+
+    Parameters
+    ----------
+    vertices_3d : (N, 3) ndarray  –  vertex positions in camera space
+    faces       : (M, 3) int ndarray  –  triangular face indices (0-based)
+
+    Returns
+    -------
+    (N, 3) ndarray of unit normals
+    """
+    verts = np.asarray(vertices_3d, dtype=float)
+    f = np.asarray(faces, dtype=np.int32)
+    v_normals = np.zeros_like(verts)
+    # face edge vectors; cross product magnitude = 2 * triangle area → area-weighted
+    e1 = verts[f[:, 1]] - verts[f[:, 0]]
+    e2 = verts[f[:, 2]] - verts[f[:, 0]]
+    face_normals = np.cross(e1, e2)  # (M, 3)
+    # scatter-accumulate into per-vertex normal buffer
+    np.add.at(v_normals, f[:, 0], face_normals)
+    np.add.at(v_normals, f[:, 1], face_normals)
+    np.add.at(v_normals, f[:, 2], face_normals)
+    norms = np.linalg.norm(v_normals, axis=1, keepdims=True)
+    norms = np.where(norms < 1e-12, 1.0, norms)
+    return v_normals / norms
+
+
+def _sample_image_colors_at_verts(
+    image_bgr: np.ndarray,
+    verts_2d: np.ndarray,
+    valid_vertices: np.ndarray,
+) -> np.ndarray:
+    """Bilinearly sample the BGR image at each projected vertex location.
+
+    Parameters
+    ----------
+    image_bgr      : (H, W, 3) uint8
+    verts_2d       : (N, 2) float  –  projected 2-D positions (x, y in pixels)
+    valid_vertices : (N,) bool     –  which vertices have a valid projection
+
+    Returns
+    -------
+    (N, 3) float array of sampled BGR colors; vertices outside the image or
+    with invalid projections get the zero vector.
+    """
+    h, w = image_bgr.shape[:2]
+    colors = np.zeros((len(verts_2d), 3), dtype=float)
+    valid = valid_vertices & np.isfinite(verts_2d).all(axis=1)
+    if not np.any(valid):
+        return colors
+    px = verts_2d[valid, 0]
+    py = verts_2d[valid, 1]
+    # bilinear weight components
+    x0 = np.clip(np.floor(px).astype(np.int32), 0, w - 1)
+    y0 = np.clip(np.floor(py).astype(np.int32), 0, h - 1)
+    x1 = np.clip(x0 + 1, 0, w - 1)
+    y1 = np.clip(y0 + 1, 0, h - 1)
+    dx = np.clip(px - np.floor(px), 0.0, 1.0)[:, None]
+    dy = np.clip(py - np.floor(py), 0.0, 1.0)[:, None]
+    c = (
+        image_bgr[y0, x0].astype(float) * (1.0 - dx) * (1.0 - dy)
+        + image_bgr[y0, x1].astype(float) * dx * (1.0 - dy)
+        + image_bgr[y1, x0].astype(float) * (1.0 - dx) * dy
+        + image_bgr[y1, x1].astype(float) * dx * dy
+    )
+    colors[valid] = c
+    return colors
+
+
 def project_points_pinhole(
     points_3d: np.ndarray,
     focal_px: float,
@@ -2726,13 +2948,29 @@ def render_projected_mesh_overlay(
     target_bbox_xyxy: Optional[Iterable[float]] = None,
     target_fill_ratio: float = 0.98,
     fit_bbox_quantile: float = 0.01,
+    alignment_anchors: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    photo_blend_ratio: float = _RENDER_DEFAULT_PHOTO_BLEND,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
+    """Render the SMPL mesh as a semi-transparent overlay on *image_bgr*.
+
+    Alignment strategy (applied in priority order):
+    1. **Pose-driven** (preferred): when *alignment_anchors* = (src_pts, dst_pts)
+       is provided, fit a 2D similarity transform (scale + rotation + translation)
+       from the camera-projected joint positions (src) to the UVD joint positions
+       (dst) and apply it to all vertex projections.  This achieves a 1:1
+       alignment with the person in the photo.
+    2. **Bbox-based fallback**: when *target_bbox_xyxy* is provided but no
+       anchors, rescale the mesh bounding box to fit inside the detector bbox.
+    3. **Raw projection**: if neither is provided, use the raw pinhole projection
+       without any 2D post-correction.
+    """
     if image_bgr is None or image_bgr.size == 0:
         raise RuntimeError("Expected a valid BGR image for mesh overlay rendering.")
 
     image_h, image_w = image_bgr.shape[:2]
     verts_2d, valid_vertices = project_points_pinhole(vertices_3d, focal_px, cx_px, cy_px)
     transform_debug: Dict[str, object] = {
+        "alignment_mode": "none",
         "target_bbox_xyxy": None,
         "target_fill_ratio": float(target_fill_ratio),
         "overlay_scale": 1.0,
@@ -2740,7 +2978,33 @@ def render_projected_mesh_overlay(
     }
 
     valid_points = verts_2d[valid_vertices]
-    if target_bbox_xyxy is not None and valid_points.size:
+
+    # --- Priority 1: pose-driven similarity transform ---
+    if alignment_anchors is not None and valid_points.size:
+        src_pts, dst_pts = alignment_anchors
+        try:
+            sim_scale, sim_R, sim_t = fit_similarity_2d(src_pts, dst_pts)
+            verts_2d = apply_similarity_2d(verts_2d, sim_scale, sim_R, sim_t)
+            # recompute anchor fit residual for diagnostics
+            src_aligned = apply_similarity_2d(src_pts, sim_scale, sim_R, sim_t)
+            anchor_errors = np.linalg.norm(src_aligned - dst_pts, axis=1)
+            transform_debug = {
+                "alignment_mode": "pose_driven_similarity",
+                "target_bbox_xyxy": None,
+                "target_fill_ratio": float(target_fill_ratio),
+                "overlay_scale": float(sim_scale),
+                "overlay_shift_xy": sim_t.tolist(),
+                "sim_rotation_deg": float(np.degrees(np.arctan2(sim_R[1, 0], sim_R[0, 0]))),
+                "anchor_mean_error_px": float(np.mean(anchor_errors)),
+                "anchor_max_error_px": float(np.max(anchor_errors)),
+                "num_anchor_pairs": int(src_pts.shape[0]),
+            }
+        except (RuntimeError, ValueError, np.linalg.LinAlgError) as _align_err:
+            # fall through to bbox-based alignment if similarity fitting fails
+            transform_debug["alignment_fallback_reason"] = str(_align_err)
+
+    # --- Priority 2: bbox-based scale + center (legacy fallback) ---
+    if transform_debug.get("alignment_mode") == "none" and target_bbox_xyxy is not None and valid_points.size:
         tx1, ty1, tx2, ty2 = [float(v) for v in target_bbox_xyxy]
         raw_mesh_min = valid_points.min(axis=0)
         raw_mesh_max = valid_points.max(axis=0)
@@ -2758,6 +3022,7 @@ def render_projected_mesh_overlay(
         scale = float(min(target_size[0] / mesh_size[0], target_size[1] / mesh_size[1]) * target_fill_ratio)
         verts_2d = (verts_2d - mesh_center[None, :]) * scale + target_center[None, :]
         transform_debug = {
+            "alignment_mode": "bbox_scale_center",
             "target_bbox_xyxy": [tx1, ty1, tx2, ty2],
             "target_fill_ratio": float(target_fill_ratio),
             "fit_bbox_quantile": quantile,
@@ -2783,24 +3048,72 @@ def render_projected_mesh_overlay(
 
     tri_3d = vertices_3d[faces_arr]
     tri_2d = verts_2d[faces_arr]
-    normals = np.cross(tri_3d[:, 1] - tri_3d[:, 0], tri_3d[:, 2] - tri_3d[:, 0])
-    normal_mag = np.linalg.norm(normals, axis=1)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        facing = np.abs(normals[:, 2]) / normal_mag
-    facing = np.where(np.isfinite(facing), facing, 0.0)
-    depths = np.mean(tri_3d[:, :, 2], axis=1)
+
+    # Projected 2-D area (painter-visible) and mean depth for depth-sort
     areas = 0.5 * np.abs(
         tri_2d[:, 0, 0] * (tri_2d[:, 1, 1] - tri_2d[:, 2, 1])
         + tri_2d[:, 1, 0] * (tri_2d[:, 2, 1] - tri_2d[:, 0, 1])
         + tri_2d[:, 2, 0] * (tri_2d[:, 0, 1] - tri_2d[:, 1, 1])
     )
+    depths = np.mean(tri_3d[:, :, 2], axis=1)
     valid_faces &= np.isfinite(depths) & np.isfinite(areas) & (areas > 0.5)
 
-    canvas = np.zeros_like(image_bgr)
-    mask = np.zeros((image_h, image_w), dtype=np.uint8)
-    draw_order = np.argsort(depths[valid_faces])[::-1]
-    face_indices = np.flatnonzero(valid_faces)[draw_order]
+    # ------------------------------------------------------------------ #
+    # Smooth Phong shading (vectorised, computed once for all faces)       #
+    # ------------------------------------------------------------------ #
+    # Per-vertex normals via area-weighted average of adjacent face normals
+    v_normals = _compute_vertex_normals(vertices_3d, faces_arr)
+
+    # Average vertex normals per face → smooth (Gouraud-like) shading normal
+    fv0, fv1, fv2 = faces_arr[:, 0], faces_arr[:, 1], faces_arr[:, 2]
+    fn_raw = (v_normals[fv0] + v_normals[fv1] + v_normals[fv2]) / 3.0   # (M, 3)
+    fn_norm = np.linalg.norm(fn_raw, axis=1, keepdims=True)
+    fn_norm = np.where(fn_norm < 1e-12, 1.0, fn_norm)
+    fn = fn_raw / fn_norm                                                  # (M, 3) unit normals
+
+    # Two directional lights in camera space (module-level normalised constants)
+    K_AMB    = _RENDER_K_AMBIENT
+    K_DIFF_K = _RENDER_K_DIFFUSE_KEY
+    K_DIFF_F = _RENDER_K_DIFFUSE_FILL
+    K_SPEC   = _RENDER_K_SPECULAR
+    SHINY    = _RENDER_SHININESS
+
+    diff_key  = np.maximum(0.0, fn @ _RENDER_LIGHT_KEY)   # (M,)
+    diff_fill = np.maximum(0.0, fn @ _RENDER_LIGHT_FILL)  # (M,)
+    # Phong specular: view direction is (0, 0, -1) in camera space
+    dot_nk   = (fn * _RENDER_LIGHT_KEY[None, :]).sum(axis=1)     # (M,)
+    refl_kz  = 2.0 * dot_nk * fn[:, 2] - _RENDER_LIGHT_KEY[2]   # z-component of reflected key light
+    spec     = np.maximum(0.0, -refl_kz) ** SHINY  # dot(refl, [0,0,-1]) = -refl_z
+
+    intensities = np.clip(
+        K_AMB + K_DIFF_K * diff_key + K_DIFF_F * diff_fill + K_SPEC * spec,
+        0.0, 1.0,
+    )                                                # (M,)
+
+    # ------------------------------------------------------------------ #
+    # Image-colour sampling (bilinear) – blended into mesh colour for     #
+    # photo-textured "1:1 overlay" appearance                             #
+    # ------------------------------------------------------------------ #
+    vert_img_colors = _sample_image_colors_at_verts(image_bgr, verts_2d, valid_vertices)
+    # Per-face image colour = average of 3 vertex samples
+    face_img_colors = (vert_img_colors[fv0] + vert_img_colors[fv1] + vert_img_colors[fv2]) / 3.0
+
     base_color = np.asarray(base_color_bgr, dtype=float)
+    # lit mesh colour + photo_blend_ratio of sampled image colour
+    face_mesh_lit = base_color[None, :] * intensities[:, None]                                    # (M, 3)
+    face_fill_rgb = np.clip(
+        (1.0 - photo_blend_ratio) * face_mesh_lit + photo_blend_ratio * face_img_colors,
+        0.0, 255.0,
+    )
+    face_fill_u8  = face_fill_rgb.astype(np.uint8)                                                # (M, 3)
+
+    # ------------------------------------------------------------------ #
+    # Painter's-algorithm draw (back-to-front depth sort)                 #
+    # ------------------------------------------------------------------ #
+    canvas = np.zeros_like(image_bgr)
+    mask   = np.zeros((image_h, image_w), dtype=np.uint8)
+    draw_order  = np.argsort(depths[valid_faces])[::-1]
+    face_indices = np.flatnonzero(valid_faces)[draw_order]
 
     for face_idx in face_indices:
         tri = tri_2d[face_idx]
@@ -2811,21 +3124,37 @@ def render_projected_mesh_overlay(
             continue
         if np.all(tri_int[:, 1] < 0) or np.all(tri_int[:, 1] >= image_h):
             continue
-        intensity = 0.55 + 0.35 * float(facing[face_idx])
-        color = np.clip(base_color * intensity, 0, 255).astype(np.uint8).tolist()
+        color = face_fill_u8[face_idx].tolist()
         cv2.fillConvexPoly(canvas, tri_int, color, lineType=cv2.LINE_AA)
-        cv2.fillConvexPoly(mask, tri_int, 255, lineType=cv2.LINE_AA)
+        cv2.fillConvexPoly(mask,   tri_int, 255,   lineType=cv2.LINE_AA)
 
     if int(mask.sum()) == 0:
         raise RuntimeError("Mesh projection produced an empty overlay mask.")
 
-    alpha_mask = (mask.astype(np.float32) / 255.0)[:, :, None] * float(np.clip(alpha, 0.0, 1.0))
-    blended = image_bgr.astype(np.float32) * (1.0 - alpha_mask) + canvas.astype(np.float32) * alpha_mask
-    blended = np.clip(blended, 0, 255).astype(np.uint8)
+    # ------------------------------------------------------------------ #
+    # Feathered alpha compositing – soft edge instead of hard binary mask  #
+    # ------------------------------------------------------------------ #
+    # Kernel size ≈ _RENDER_FEATHER_RATIO of the shorter image dimension, always odd ≥ 3
+    feather_ks = max(3, int(min(image_w, image_h) * _RENDER_FEATHER_RATIO))
+    if feather_ks % 2 == 0:
+        feather_ks += 1
+    mask_float  = cv2.GaussianBlur(mask.astype(np.float32) / 255.0,
+                                   (feather_ks, feather_ks), 0)
+    alpha_val   = float(np.clip(alpha, 0.0, 1.0))
+    alpha_map   = mask_float[:, :, None] * alpha_val
+    blended     = image_bgr.astype(np.float32) * (1.0 - alpha_map) + canvas.astype(np.float32) * alpha_map
+    blended     = np.clip(blended, 0, 255).astype(np.uint8)
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # ------------------------------------------------------------------ #
+    # Silhouette edges: 2 px outline + 1 px inner highlight               #
+    # ------------------------------------------------------------------ #
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if contours:
-        cv2.drawContours(blended, contours, -1, outline_color_bgr, 1, lineType=cv2.LINE_AA)
+        # outer 2 px stroke with the requested outline colour
+        cv2.drawContours(blended, contours, -1, outline_color_bgr, 2, lineType=cv2.LINE_AA)
+        # inner 1 px lighter highlight for a crisp rim-light feel (_RENDER_RIM_HIGHLIGHT_OFFSET DN)
+        highlight = tuple(int(min(255, c + _RENDER_RIM_HIGHLIGHT_OFFSET)) for c in outline_color_bgr)
+        cv2.drawContours(blended, contours, -1, highlight, 1, lineType=cv2.LINE_AA)
 
     return blended, {
         "mask_area_px": int(np.count_nonzero(mask)),
@@ -2844,7 +3173,17 @@ def render_hybrik_mesh_overlay(
     base_color_bgr: Tuple[int, int, int] = (222, 206, 184),
     outline_color_bgr: Tuple[int, int, int] = (154, 136, 113),
     fit_to_detector_bbox: bool = True,
+    use_pose_alignment: bool = True,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
+    """Render the SMPL mesh over the input image with adaptive 1:1 alignment.
+
+    When *use_pose_alignment* is True (the default), a 2D similarity transform
+    is fitted from camera-projected joint positions to the UVD joint positions
+    predicted by HybrIK.  This makes the mesh overlay precisely match the pose
+    visible in the photograph.  If alignment anchor fitting fails, the method
+    falls back to detector-bbox-based scaling when *fit_to_detector_bbox* is
+    True, and then to the raw projection.
+    """
     if isinstance(image_or_path, str):
         image_bgr = _read_image_unicode(image_or_path)
         image_path = os.path.abspath(image_or_path)
@@ -2867,11 +3206,28 @@ def render_hybrik_mesh_overlay(
 
     vertices, faces = load_obj_mesh(mesh_obj_path)
     vertices_cam = vertices + np.asarray(translation, dtype=float)[None, :]
+
+    # Build pose-driven alignment anchors (src = camera-projected joints,
+    # dst = UVD joint positions predicted by HybrIK).
+    alignment_anchors: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    if use_pose_alignment:
+        try:
+            alignment_anchors = build_pose_alignment_anchors(
+                data,
+                focal_px=projection["focal_px"],
+                cx_px=projection["cx_px"],
+                cy_px=projection["cy_px"],
+            )
+        except (RuntimeError, ValueError, np.linalg.LinAlgError):
+            alignment_anchors = None
+
+    # Detector bbox is used as a fallback when pose alignment is unavailable.
     target_bbox = None
-    if fit_to_detector_bbox:
+    if fit_to_detector_bbox and alignment_anchors is None:
         bbox = data.get("detector_bbox_xyxy")
         if isinstance(bbox, list) and len(bbox) == 4:
             target_bbox = bbox
+
     overlay_bgr, render_debug = render_projected_mesh_overlay(
         image_bgr=image_bgr,
         vertices_3d=vertices_cam,
@@ -2883,17 +3239,20 @@ def render_hybrik_mesh_overlay(
         base_color_bgr=base_color_bgr,
         outline_color_bgr=outline_color_bgr,
         target_bbox_xyxy=target_bbox,
+        alignment_anchors=alignment_anchors,
     )
     debug = {
         "image_path": image_path,
         "mesh_obj_path": os.path.abspath(mesh_obj_path),
         "projection": projection,
         "fit_to_detector_bbox": bool(fit_to_detector_bbox),
+        "use_pose_alignment": bool(use_pose_alignment),
         "vertices_count": int(vertices.shape[0]),
         "faces_count": int(faces.shape[0]),
         **render_debug,
     }
     return overlay_bgr, debug
+
 
 
 def load_pose_frame_points(

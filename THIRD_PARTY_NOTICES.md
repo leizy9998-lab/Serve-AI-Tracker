@@ -61,6 +61,53 @@ If you keep this repository public:
 - keep large model assets and checkpoints out of Git unless redistribution rights are clear
 - when in doubt, link users to the official download pages instead of bundling the files
 
+## Additional Repository Materials
+
+### MediaPipe Pose Landmarker Download Helper
+
+The repository includes a small download helper:
+
+- `download_model.py`
+
+It downloads the MediaPipe Pose Landmarker model from:
+
+- https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task
+
+Practical rule:
+
+- prefer local download from the original upstream source
+- verify the applicable upstream model and platform terms before redistribution
+
+### User-Supplied Or Sample Media
+
+Some local assets, screenshots, or sample media may be user-supplied or externally sourced.
+
+Practical rule:
+
+- do not assume they are redistributable unless they are clearly marked as original and public-safe
+- remove personal identity documents, sensitive screenshots, and private media from public releases
+
+### Dependencies Installed Via Package Managers
+
+This repository also relies on third-party Python packages declared in `requirements.txt`, including but not limited to:
+
+- `gradio`
+- `mediapipe`
+- `opencv-python-headless`
+- `numpy`
+- `pandas`
+
+These dependencies are governed by their own licenses. Installation of a package does not transfer ownership of that package to this repository.
+
+## Maintainer Guidance
+
+Before making the repository public or tagging a release:
+
+1. confirm every bundled third-party directory has its original license file
+2. avoid committing third-party model binaries unless redistribution rights are clear
+3. remove personal documents, IDs, test media, and local-only configuration
+4. keep attribution links and notices in the root README
+
 ## Official Sources
 
 - HybrIK official repository: https://github.com/jeffffffli/HybrIK

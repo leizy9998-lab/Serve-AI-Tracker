@@ -31,3 +31,10 @@ third_party/HybrIK-main/model_files/
 third_party/HybrIK-main/pretrained_models/
 third_party/HybrIK-main/assets/
 third_party/HybrIK-main/examples/
+models/*.task
+*.pth
+*.pt
+*.onnx
+
+# Sensitive or local-only files
+# Keep personal documents and other private local assets out of the repo.
