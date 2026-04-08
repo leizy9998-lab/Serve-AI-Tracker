@@ -1,15 +1,15 @@
-# Large videos and media clips
+# Video files
 *.mp4
 *.mov
 *.avi
 *.mkv
 
-# Large tabular exports and intermediate pose CSV files
+# Tabular outputs and local analysis exports
 *.xls
 *.xlsx
 *.csv
 
-# Local reports and generated output folders
+# Generated reports and working directories
 serve_report/
 serve_report_djokovic/
 serve_report_raw/
@@ -19,12 +19,12 @@ input/
 out/
 output/
 
-# Python / editor noise
+# Python and editor artifacts
 __pycache__/
 .DS_Store
 .vscode/
 
-# Large third-party assets and checkpoints not meant for Git
+# Third-party resources and large local assets
 third_party/HybrIK_resources.zip
 third_party/HybrIK-main.zip
 third_party/HybrIK-main/model_files/

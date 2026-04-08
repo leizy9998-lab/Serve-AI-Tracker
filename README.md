@@ -33,6 +33,29 @@ If you plan to publish or redistribute the repository, read [THIRD_PARTY_NOTICES
 
 The demo above shows the current smooth-pose tracking overlay produced by the local report pipeline.
 
+## 3D Mesh Showcase
+
+The examples below come from a regenerated compact report and show the original frame beside the latest 3D mesh reconstruction overlay.
+
+<table>
+  <tr>
+    <td align="center"><strong>Trophy</strong></td>
+    <td align="center"><strong>Racket Drop</strong></td>
+  </tr>
+  <tr>
+    <td><img src="./assets/showcase/roger-3d-mesh/trophy.png" alt="Trophy phase 3D mesh overlay comparison" width="100%"></td>
+    <td><img src="./assets/showcase/roger-3d-mesh/racket-drop.png" alt="Racket drop phase 3D mesh overlay comparison" width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Contact</strong></td>
+    <td align="center"><strong>Finish</strong></td>
+  </tr>
+  <tr>
+    <td><img src="./assets/showcase/roger-3d-mesh/contact.png" alt="Contact phase 3D mesh overlay comparison" width="100%"></td>
+    <td><img src="./assets/showcase/roger-3d-mesh/finish.png" alt="Finish phase 3D mesh overlay comparison" width="100%"></td>
+  </tr>
+</table>
+
 ## Highlights
 
 - single-player serve tracking from broadcast-style tennis clips
@@ -46,7 +69,7 @@ The demo above shows the current smooth-pose tracking overlay produced by the lo
 - [README.md](./README.md): public project overview
 - [LOCAL_3D_ASSETS.md](./LOCAL_3D_ASSETS.md): practical local 3D asset setup
 - [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md): third-party code and model asset licensing notes
-- [PRIVACY_AND_COMPLIANCE.md](./PRIVACY_AND_COMPLIANCE.md): publication and redistribution guardrails
+- [PRIVACY_AND_COMPLIANCE.md](./PRIVACY_AND_COMPLIANCE.md): privacy, publishing, and redistribution checklist
 - [CONTRIBUTING.md](./CONTRIBUTING.md): contribution guidelines
 
 ## What The Project Does
@@ -168,8 +191,7 @@ As of April 2, 2026, the public 2D dependency pins were refreshed to newer PyPI 
 
 - the original repository code is now released under the root [MIT License](./LICENSE)
 - the 3D stack includes third-party code and model assets that are not all covered by the same terms
-- if you plan to publish, fork, redistribute, or commercialize the 3D path, read [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) first
-- public releases should also be checked against [PRIVACY_AND_COMPLIANCE.md](./PRIVACY_AND_COMPLIANCE.md)
+- if you plan to publish, fork, redistribute, or commercialize the 3D path, read [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) and [PRIVACY_AND_COMPLIANCE.md](./PRIVACY_AND_COMPLIANCE.md) first
 
 ## Repository License Status
 

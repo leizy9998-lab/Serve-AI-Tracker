@@ -803,6 +803,9 @@ def run_hybrik_inference(
     transl = pose_output.transl.squeeze(0).detach().cpu().numpy()
     cam_root = pose_output.cam_root.squeeze(0).detach().cpu().numpy()
     faces = hybrik_model.smpl.faces.astype(np.int32)
+    hybrik_depth_factor = float(getattr(hybrik_model, "depth_factor", 2.2))
+    hybrik_focal_length = float(getattr(hybrik_model, "focal_length", 1000.0))
+    hybrik_input_size = float(getattr(hybrik_model, "input_size", 256.0))
 
     bbox_xywh = _hybrik_xyxy_to_xywh(bbox)
     points_2d = pred_uvd[:, :2].copy() * bbox_xywh[2]
@@ -851,6 +854,9 @@ def run_hybrik_inference(
         "camera": pred_camera,
         "translation": transl,
         "cam_root": cam_root,
+        "depth_factor": hybrik_depth_factor,
+        "hybrik_focal_length": hybrik_focal_length,
+        "hybrik_input_size": hybrik_input_size,
         "betas": pred_betas,
         "phi": pred_phi,
         "theta_mats": pred_theta,
@@ -1486,6 +1492,7 @@ def _load_keyframe_3d_summary(keyframe_dir: str, out_dir: str, run_id: int) -> O
 def _maybe_generate_keyframe_3d_bundle(
     out_dir: str,
     phase_frame_nums: Dict[str, Optional[int]],
+    pose_csv: Optional[str],
     lang: str,
     run_id: int,
     verify_3d: str,
@@ -1542,11 +1549,45 @@ def _maybe_generate_keyframe_3d_bundle(
                 dominant_hand="right",
             )
             phase_metrics_3d = {**metrics_3d, **phase_metrics_3d}
-            overlay_img, overlay_debug = serve_score.render_hybrik_mesh_overlay(
-                image_or_path=image_path,
-                data_or_path=json_path,
-                mesh_obj_path=obj_path,
-            )
+            pose_points_2d = None
+            frame_num = phase_frame_nums.get(phase)
+            if pose_csv and frame_num is not None:
+                try:
+                    frame_img = _read_image_unicode(image_path)
+                    if frame_img is not None and frame_img.size:
+                        image_h, image_w = frame_img.shape[:2]
+                        pose_points_2d = serve_score.load_pose_frame_points(
+                            pose_csv=pose_csv,
+                            frame_num=int(frame_num),
+                            image_w=image_w,
+                            image_h=image_h,
+                            use_coords="smooth",
+                        )
+                except Exception:
+                    pose_points_2d = None
+            render_params = inspect.signature(serve_score.render_hybrik_mesh_overlay).parameters
+            render_kwargs = {
+                "image_or_path": image_path,
+                "data_or_path": json_path,
+                "mesh_obj_path": obj_path,
+            }
+            if "pose_points_2d" in render_params:
+                render_kwargs["pose_points_2d"] = pose_points_2d
+            if "adaptive_target_bbox_from_pose" in render_params:
+                render_kwargs["adaptive_target_bbox_from_pose"] = True
+            if "align_using_pose_points" in render_params:
+                render_kwargs["align_using_pose_points"] = True
+            elif "use_pose_alignment" in render_params:
+                render_kwargs["use_pose_alignment"] = True
+            if "fit_to_detector_bbox" in render_params:
+                render_kwargs["fit_to_detector_bbox"] = True
+            if "target_fit_mode" in render_params:
+                render_kwargs["target_fit_mode"] = "cover"
+            if "target_fill_ratio" in render_params:
+                render_kwargs["target_fill_ratio"] = 0.96
+            if "fit_bbox_quantile" in render_params:
+                render_kwargs["fit_bbox_quantile"] = 0.02
+            overlay_img, overlay_debug = serve_score.render_hybrik_mesh_overlay(**render_kwargs)
             _write_image_unicode(overlay_path, overlay_img)
             _save_compare_image(image_path, overlay_img, compare_path, lang)
 
@@ -1555,6 +1596,7 @@ def _maybe_generate_keyframe_3d_bundle(
                 "label": _phase_display_name(phase, lang),
                 "frame_num": phase_frame_nums.get(phase),
                 "phase_metrics_3d": phase_metrics_3d,
+                "overlay_debug": overlay_debug,
                 "artifacts": {
                     "compare_png": os.path.abspath(compare_path),
                 },
@@ -2962,6 +3004,7 @@ def main() -> None:
     keyframe_3d = _maybe_generate_keyframe_3d_bundle(
         out_dir=args.out_dir,
         phase_frame_nums=phase_frame_nums,
+        pose_csv=pose_csv,
         lang=args.lang,
         run_id=run_id,
         verify_3d=args.verify_3d,
